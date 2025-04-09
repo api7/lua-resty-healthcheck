@@ -58,8 +58,8 @@ qq{
                 events_module = "resty.events",
                 checks = {
                     active = {
+                        http_method = "POST",
                         http_path = "/status",
-                        request_method = "POST",
                         request_body = '{"key": "value"}',
                         healthy  = {
                             interval = 0.1
@@ -109,8 +109,8 @@ qq{
                 events_module = "resty.events",
                 checks = {
                     active = {
+                        http_method = "POST",
                         http_path = "/status",
-                        request_method = "POST",
                         request_body = "",
                         healthy  = {
                             interval = 0.1

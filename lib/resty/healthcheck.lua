@@ -1113,7 +1113,7 @@ function checker:run_single_check(ip, port, hostname, hostheader)
     self.checks.active._headers_str = headers or ""
   end
 
-  local method = self.checks.active.request_method
+  local method = self.checks.active.http_method
   local path = self.checks.active.http_path
   local body = self.checks.active.request_body
   local final_hostheader = hostheader or hostname or ip
@@ -1501,7 +1501,7 @@ local defaults = {
       type = "http",
       timeout = 1,
       concurrency = 10,
-      request_method = "GET",
+      http_method = "GET",
       http_path = "/",
       request_body = "",
       https_sni = NO_DEFAULT,
@@ -1577,7 +1577,7 @@ end
 -- * `checks.active.type`: "http", "https" or "tcp" (default is "http")
 -- * `checks.active.timeout`: socket timeout for active checks (in seconds)
 -- * `checks.active.concurrency`: number of targets to check concurrently
--- * `checks.active.request_method`: method of HTTP request to run on active checks
+-- * `checks.active.http_method`: method of HTTP request to run on active checks
 -- * `checks.active.http_path`: path to use in HTTP request to run on active checks
 -- * `checks.active.request_body`: body to use in `POST` HTTP request to run on active checks
 -- * `checks.active.https_sni`: SNI server name incase of HTTPS
