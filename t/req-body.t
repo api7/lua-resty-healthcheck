@@ -29,11 +29,12 @@ qq{
 --- config
     location = /t {
         content_by_lua_block {
+            local we = require "resty.worker.events"
+            assert(we.configure{ shm = "my_worker_events", interval = 0.1 })
             local healthcheck = require("resty.healthcheck")
             local checker = healthcheck.new({
                 name = "testing",
                 shm_name = "test_shm",
-                events_module = "resty.events",
                 checks = {
                     active = {
                         http_method = "POST",
@@ -63,6 +64,9 @@ Connection: close
 Host: 127.0.0.1
 Content-Length: 16
 {"key": "value"}
+
+
+
 === TEST 2: POST with empty body
 --- http_config eval
 qq{
@@ -77,11 +81,12 @@ qq{
 --- config
     location = /t {
         content_by_lua_block {
+            local we = require "resty.worker.events"
+            assert(we.configure{ shm = "my_worker_events", interval = 0.1 })
             local healthcheck = require("resty.healthcheck")
             local checker = healthcheck.new({
                 name = "testing",
                 shm_name = "test_shm",
-                events_module = "resty.events",
                 checks = {
                     active = {
                         http_method = "POST",
