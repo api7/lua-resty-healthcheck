@@ -900,7 +900,7 @@ function checker:run_single_check(ip, port, hostname, hostheader)
 
   local method = self.checks.active.http_method
   local path = self.checks.active.http_path
-  local body = self.checks.active.request_body
+  local body = self.checks.active.http_req_body
   local final_hostheader = hostheader or hostname or ip
   local request
   if method == "GET" then
@@ -1289,7 +1289,7 @@ local defaults = {
       concurrency = 10,
       http_method = "GET",
       http_path = "/",
-      request_body = "",
+      http_req_body = "",
       https_verify_certificate = true,
       healthy = {
         interval = 0, -- 0 = disabled by default
@@ -1361,7 +1361,7 @@ end
 -- * `checks.active.concurrency`: number of targets to check concurrently
 -- * `checks.active.http_method`: method of HTTP request to run on active checks
 -- * `checks.active.http_path`: path to use in HTTP request to run on active checks
--- * `checks.active.request_body`: body to use in `POST` HTTP request to run on active checks
+-- * `checks.active.http_req_body`: body to use in `POST` HTTP request to run on active checks
 -- * `checks.active.https_verify_certificate`: boolean indicating whether to verify the HTTPS certificate
 -- * `checks.active.healthy.interval`: interval between checks for healthy targets (in seconds)
 -- * `checks.active.healthy.http_statuses`: which HTTP statuses to consider a success

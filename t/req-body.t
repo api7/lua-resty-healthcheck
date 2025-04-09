@@ -39,7 +39,7 @@ qq{
                     active = {
                         http_method = "POST",
                         http_path = "/status",
-                        request_body = '{"key": "value"}',
+                        http_req_body = '{"key": "value"}',
                         healthy  = {
                             interval = 0.1
                         }
@@ -91,7 +91,7 @@ qq{
                     active = {
                         http_method = "POST",
                         http_path = "/status",
-                        request_body = "",
+                        http_req_body = "",
                         healthy  = {
                             interval = 0.1
                         }
