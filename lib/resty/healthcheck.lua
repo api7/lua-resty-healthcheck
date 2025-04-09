@@ -903,14 +903,10 @@ function checker:run_single_check(ip, port, hostname, hostheader)
   local body = self.checks.active.http_req_body
   local final_hostheader = hostheader or hostname or ip
   local request
-  if method == "GET" then
-    request = ("GET %s HTTP/1.1\r\nConnection: close\r\n%sHost: %s\r\n\r\n"):format(path, headers, final_hostheader)
+  if body and #body > 0 then
+    request = ("%s %s HTTP/1.1\r\nConnection: close\r\n%sHost: %s\r\nContent-Length: %d\r\n\r\n%s"):format(method, path, headers, final_hostheader, #body, body)
   else
-    if body and #body > 0 then
-      request = ("%s %s HTTP/1.1\r\nConnection: close\r\n%sHost: %s\r\nContent-Length: %d\r\n\r\n%s"):format(method, path, headers, final_hostheader, #body, body)
-    else
-      request = ("%s %s HTTP/1.1\r\nConnection: close\r\n%sHost: %s\r\n\r\n"):format(method, path, headers, final_hostheader)
-    end
+    request = ("%s %s HTTP/1.1\r\nConnection: close\r\n%sHost: %s\r\n\r\n"):format(method, path, headers, final_hostheader)
   end
   self:log(DEBUG, "request head: ", request)
 
