@@ -1113,8 +1113,20 @@ function checker:run_single_check(ip, port, hostname, hostheader)
     self.checks.active._headers_str = headers or ""
   end
 
+  local method = self.checks.active.request_method
   local path = self.checks.active.http_path
-  local request = ("GET %s HTTP/1.1\r\nConnection: close\r\n%sHost: %s\r\n\r\n"):format(path, headers, hostheader or hostname or ip)
+  local body = self.checks.active.request_body
+  local final_hostheader = hostheader or hostname or ip
+  local request
+  if method == "GET" then
+    request = ("GET %s HTTP/1.1\r\nConnection: close\r\n%sHost: %s\r\n\r\n"):format(path, headers, final_hostheader)
+  else
+    if body and #body > 0 then
+      request = ("%s %s HTTP/1.1\r\nConnection: close\r\n%sHost: %s\r\nContent-Length: %d\r\n\r\n%s"):format(method, path, headers, final_hostheader, #body, body)
+    else
+      request = ("%s %s HTTP/1.1\r\nConnection: close\r\n%sHost: %s\r\n\r\n"):format(method, path, headers, final_hostheader)
+    end
+  end
   self:log(DEBUG, "request head: ", request)
 
   local bytes
@@ -1489,7 +1501,9 @@ local defaults = {
       type = "http",
       timeout = 1,
       concurrency = 10,
+      request_method = "GET",
       http_path = "/",
+      request_body = "",
       https_sni = NO_DEFAULT,
       https_verify_certificate = true,
       headers = {""},
@@ -1563,7 +1577,9 @@ end
 -- * `checks.active.type`: "http", "https" or "tcp" (default is "http")
 -- * `checks.active.timeout`: socket timeout for active checks (in seconds)
 -- * `checks.active.concurrency`: number of targets to check concurrently
--- * `checks.active.http_path`: path to use in `GET` HTTP request to run on active checks
+-- * `checks.active.request_method`: method of HTTP request to run on active checks
+-- * `checks.active.http_path`: path to use in HTTP request to run on active checks
+-- * `checks.active.request_body`: body to use in `POST` HTTP request to run on active checks
 -- * `checks.active.https_sni`: SNI server name incase of HTTPS
 -- * `checks.active.https_verify_certificate`: boolean indicating whether to verify the HTTPS certificate
 -- * `checks.active.headers`: one or more lists of values indexed by header name
