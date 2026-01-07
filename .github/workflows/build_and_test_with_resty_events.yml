@@ -9,15 +9,15 @@ on:
 jobs:
   build:
     name: CI using lua-resty-events
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        openresty-version: [1.21.4.1]
+        openresty-version: [1.27.1.2]
 
     steps:
       - name: Update and install OS dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y libssl-dev ssl-cert
+          sudo apt-get update && sudo apt-get install -y libssl-dev ssl-cert libpcre3 libpcre3-dev
           sudo systemctl disable nginx
           sudo systemctl stop nginx
 
@@ -25,7 +25,7 @@ jobs:
         env:
           OPENRESTY_VER: ${{ matrix.openresty-version }}
           RESTY_EVENTS_VER: 0.1.2
-          LUAROCKS_VER: 3.9.0
+          LUAROCKS_VER: 3.12.0
           OPENSSL_VER: 1.1.1q
           PCRE_VER: 8.45
         run: |
