@@ -755,6 +755,7 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
     return true
   end
 
+  hostname = hostname or ip
   port = tonumber(port)
   local target = get_target(self, ip, port, hostname)
   if not target then

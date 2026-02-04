@@ -162,3 +162,76 @@ GET /t
 --- no_error_log
 [error]
 --- timeout: 5
+
+
+
+=== TEST 3: passive healthcheck without hostname
+--- http_config eval
+qq{
+    $::HttpConfig
+
+    server {
+        listen 2119;
+        location = /status {
+            return 200;
+        }
+    }
+}
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+events_module = "resty.events",
+                type = "http",
+                checks = {
+                    active = {
+                        http_path = "/status",
+                        healthy  = {
+                            interval = 999, -- we don't want active checks
+                            successes = 3,
+                        },
+                        unhealthy  = {
+                            interval = 999, -- we don't want active checks
+                            tcp_failures = 2,
+                            http_failures = 3,
+                        }
+                    },
+                    passive = {
+                        healthy  = {
+                            successes = 3,
+                        },
+                        unhealthy  = {
+                            tcp_failures = 2,
+                            http_failures = 3,
+                        }
+                    }
+                }
+            })
+            local ok, err = checker:add_target("127.0.0.1", 2119, nil, true)
+            ngx.sleep(0.01)
+            checker:report_http_status("127.0.0.1", 2119, nil, 500, "passive")
+            checker:report_http_status("127.0.0.1", 2119, nil, 500, "passive")
+            checker:report_http_status("127.0.0.1", 2119, nil, 500, "passive")
+            ngx.sleep(0.01)
+            assert(checker:get_target_status("127.0.0.1", 2119), false)
+            local nodes = healthcheck.get_target_list(name, shm_name)
+            assert(#nodes == 1, "invalid number of nodes")
+            assert(nodes[1].ip == "127.0.0.1", "invalid ip")
+            assert(nodes[1].port == 2119, "invalid port")
+            assert(nodes[1].status == "unhealthy", "invalid status")
+            assert(nodes[1].counter.success == 0, "invalid success counter")
+            assert(nodes[1].counter.tcp_failure == 0, "invalid tcp failure counter")
+            assert(nodes[1].counter.http_failure == 3, "invalid http failure counter")
+            assert(nodes[1].counter.timeout_failure == 0, "invalid timeout failure counter")
+        }
+    }
+--- request
+GET /t
+--- error_log
+unhealthy HTTP increment (1/3) for '(127.0.0.1:2119)'
+unhealthy HTTP increment (2/3) for '(127.0.0.1:2119)'
+unhealthy HTTP increment (3/3) for '(127.0.0.1:2119)'
+event: target status '(127.0.0.1:2119)' from 'true' to 'falsedf'
