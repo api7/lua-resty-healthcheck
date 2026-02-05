@@ -159,7 +159,7 @@ true
 false
 
 
-=== TEST 4: set_target_status() resets the success counters
+=== TEST 3: set_target_status() resets the success counters
 --- http_config eval
 qq{
     $::HttpConfig
