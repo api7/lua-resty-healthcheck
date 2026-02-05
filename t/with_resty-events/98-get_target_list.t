@@ -181,9 +181,11 @@ qq{
     location = /t {
         content_by_lua_block {
             local healthcheck = require("resty.healthcheck")
+            local name = "testing"
+            local shm_name = "test_shm"
             local checker = healthcheck.new({
-                name = "testing",
-                shm_name = "test_shm",
+                name = name,
+                shm_name = shm_name,
 events_module = "resty.events",
                 type = "http",
                 checks = {
@@ -216,7 +218,7 @@ events_module = "resty.events",
             checker:report_http_status("127.0.0.1", 2119, nil, 500, "passive")
             checker:report_http_status("127.0.0.1", 2119, nil, 500, "passive")
             ngx.sleep(0.01)
-            assert(checker:get_target_status("127.0.0.1", 2119), false)
+            assert(checker:get_target_status("127.0.0.1", 2119) == false, "target should be unhealthy")
             local nodes = healthcheck.get_target_list(name, shm_name)
             assert(#nodes == 1, "invalid number of nodes")
             assert(nodes[1].ip == "127.0.0.1", "invalid ip")
@@ -231,7 +233,7 @@ events_module = "resty.events",
 --- request
 GET /t
 --- error_log
-unhealthy HTTP increment (1/3) for '(127.0.0.1:2119)'
-unhealthy HTTP increment (2/3) for '(127.0.0.1:2119)'
-unhealthy HTTP increment (3/3) for '(127.0.0.1:2119)'
-event: target status '(127.0.0.1:2119)' from 'true' to 'falsedf'
+unhealthy HTTP increment (1/3) for '127.0.0.1(127.0.0.1:2119)'
+unhealthy HTTP increment (2/3) for '127.0.0.1(127.0.0.1:2119)'
+unhealthy HTTP increment (3/3) for '127.0.0.1(127.0.0.1:2119)'
+event: target status '127.0.0.1(127.0.0.1:2119)' from 'true' to 'false'

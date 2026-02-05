@@ -980,6 +980,7 @@ function checker:set_target_status(ip, port, hostname, is_healthy)
   ip   = tostring(assert(ip, "no ip address provided"))
   port = assert(tonumber(port), "no port number provided")
   assert(type(is_healthy) == "boolean")
+  hostname = hostname or ip
 
   local health_report = is_healthy and "healthy" or "unhealthy"
 

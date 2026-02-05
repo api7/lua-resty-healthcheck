@@ -105,12 +105,12 @@ GET /t
 false
 false
 --- error_log
-unhealthy TIMEOUT increment (1/2) for '(127.0.0.1:2122)'
-unhealthy TIMEOUT increment (2/2) for '(127.0.0.1:2122)'
-event: target status '(127.0.0.1:2122)' from 'true' to 'false'
-unhealthy TIMEOUT increment (1/2) for '(127.0.0.1:2113)'
-unhealthy TIMEOUT increment (2/2) for '(127.0.0.1:2113)'
-event: target status '(127.0.0.1:2113)' from 'true' to 'false'
+unhealthy TIMEOUT increment (1/2) for '127.0.0.1(127.0.0.1:2122)'
+unhealthy TIMEOUT increment (2/2) for '127.0.0.1(127.0.0.1:2122)'
+event: target status '127.0.0.1(127.0.0.1:2122)' from 'true' to 'false'
+unhealthy TIMEOUT increment (1/2) for '127.0.0.1(127.0.0.1:2113)'
+unhealthy TIMEOUT increment (2/2) for '127.0.0.1(127.0.0.1:2113)'
+event: target status '127.0.0.1(127.0.0.1:2113)' from 'true' to 'false'
 
 
 === TEST 2: report_timeout() for active is a nop when active.unhealthy.timeouts == 0
@@ -175,7 +175,7 @@ GET /t
 true
 --- no_error_log
 unhealthy TCP increment
-event: target status '(127.0.0.1:2122)' from 'true' to 'false'
+event: target status '127.0.0.1(127.0.0.1:2122)' from 'true' to 'false'
 
 
 
@@ -241,4 +241,4 @@ GET /t
 true
 --- no_error_log
 unhealthy TCP increment
-event: target status '(127.0.0.1:2122)' from 'true' to 'false'
+event: target status '127.0.0.1(127.0.0.1:2122)' from 'true' to 'false'

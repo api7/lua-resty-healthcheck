@@ -105,14 +105,14 @@ GET /t
 false
 false
 --- error_log
-unhealthy HTTP increment (1/3) for '(127.0.0.1:2119)'
-unhealthy HTTP increment (2/3) for '(127.0.0.1:2119)'
-unhealthy HTTP increment (3/3) for '(127.0.0.1:2119)'
-event: target status '(127.0.0.1:2119)' from 'true' to 'false'
-unhealthy HTTP increment (1/3) for '(127.0.0.1:2113)'
-unhealthy HTTP increment (2/3) for '(127.0.0.1:2113)'
-unhealthy HTTP increment (3/3) for '(127.0.0.1:2113)'
-event: target status '(127.0.0.1:2113)' from 'true' to 'false'
+unhealthy HTTP increment (1/3) for '127.0.0.1(127.0.0.1:2119)'
+unhealthy HTTP increment (2/3) for '127.0.0.1(127.0.0.1:2119)'
+unhealthy HTTP increment (3/3) for '127.0.0.1(127.0.0.1:2119)'
+event: target status '127.0.0.1(127.0.0.1:2119)' from 'true' to 'false'
+unhealthy HTTP increment (1/3) for '127.0.0.1(127.0.0.1:2113)'
+unhealthy HTTP increment (2/3) for '127.0.0.1(127.0.0.1:2113)'
+unhealthy HTTP increment (3/3) for '127.0.0.1(127.0.0.1:2113)'
+event: target status '127.0.0.1(127.0.0.1:2113)' from 'true' to 'false'
 
 
 
@@ -183,16 +183,16 @@ GET /t
 true
 true
 --- error_log
-healthy SUCCESS increment (1/4) for '(127.0.0.1:2119)'
-healthy SUCCESS increment (2/4) for '(127.0.0.1:2119)'
-healthy SUCCESS increment (3/4) for '(127.0.0.1:2119)'
-healthy SUCCESS increment (4/4) for '(127.0.0.1:2119)'
-event: target status '(127.0.0.1:2119)' from 'false' to 'true'
-healthy SUCCESS increment (1/4) for '(127.0.0.1:2113)'
-healthy SUCCESS increment (2/4) for '(127.0.0.1:2113)'
-healthy SUCCESS increment (3/4) for '(127.0.0.1:2113)'
-healthy SUCCESS increment (4/4) for '(127.0.0.1:2113)'
-event: target status '(127.0.0.1:2113)' from 'false' to 'true'
+healthy SUCCESS increment (1/4) for '127.0.0.1(127.0.0.1:2119)'
+healthy SUCCESS increment (2/4) for '127.0.0.1(127.0.0.1:2119)'
+healthy SUCCESS increment (3/4) for '127.0.0.1(127.0.0.1:2119)'
+healthy SUCCESS increment (4/4) for '127.0.0.1(127.0.0.1:2119)'
+event: target status '127.0.0.1(127.0.0.1:2119)' from 'false' to 'true'
+healthy SUCCESS increment (1/4) for '127.0.0.1(127.0.0.1:2113)'
+healthy SUCCESS increment (2/4) for '127.0.0.1(127.0.0.1:2113)'
+healthy SUCCESS increment (3/4) for '127.0.0.1(127.0.0.1:2113)'
+healthy SUCCESS increment (4/4) for '127.0.0.1(127.0.0.1:2113)'
+event: target status '127.0.0.1(127.0.0.1:2113)' from 'false' to 'true'
 
 
 === TEST 3: report_http_status() with success is a nop when passive.healthy.successes == 0
@@ -256,7 +256,7 @@ GET /t
 false
 --- no_error_log
 healthy SUCCESS increment
-event: target status '127.0.0.1 (127.0.0.1:2119)' from 'false' to 'true'
+event: target status '127.0.0.1(127.0.0.1:2119)' from 'false' to 'true'
 
 
 === TEST 4: report_http_status() with success is a nop when active.healthy.successes == 0
@@ -320,7 +320,7 @@ GET /t
 false
 --- no_error_log
 healthy SUCCESS increment
-event: target status '127.0.0.1 (127.0.0.1:2119)' from 'false' to 'true'
+event: target status '127.0.0.1(127.0.0.1:2119)' from 'false' to 'true'
 
 
 === TEST 5: report_http_status() with failure is a nop when passive.unhealthy.http_failures == 0
@@ -384,7 +384,7 @@ GET /t
 true
 --- no_error_log
 unhealthy HTTP increment
-event: target status '127.0.0.1 (127.0.0.1:2119)' from 'true' to 'false'
+event: target status '127.0.0.1(127.0.0.1:2119)' from 'true' to 'false'
 
 
 === TEST 4: report_http_status() with success is a nop when active.unhealthy.http_failures == 0
@@ -448,7 +448,7 @@ GET /t
 true
 --- no_error_log
 unhealthy HTTP increment
-event: target status '(127.0.0.1:2119)' from 'true' to 'false'
+event: target status '127.0.0.1(127.0.0.1:2119)' from 'true' to 'false'
 
 
 === TEST 5: report_http_status() must work in log phase
