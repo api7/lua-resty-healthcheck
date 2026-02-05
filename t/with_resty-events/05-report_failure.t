@@ -105,14 +105,14 @@ GET /t
 false
 false
 --- error_log
-unhealthy HTTP increment (1/3) for '(127.0.0.1:2117)'
-unhealthy HTTP increment (2/3) for '(127.0.0.1:2117)'
-unhealthy HTTP increment (3/3) for '(127.0.0.1:2117)'
-event: target status '(127.0.0.1:2117)' from 'true' to 'false'
-unhealthy HTTP increment (1/3) for '(127.0.0.1:2113)'
-unhealthy HTTP increment (2/3) for '(127.0.0.1:2113)'
-unhealthy HTTP increment (3/3) for '(127.0.0.1:2113)'
-event: target status '(127.0.0.1:2113)' from 'true' to 'false'
+unhealthy HTTP increment (1/3) for '127.0.0.1(127.0.0.1:2117)'
+unhealthy HTTP increment (2/3) for '127.0.0.1(127.0.0.1:2117)'
+unhealthy HTTP increment (3/3) for '127.0.0.1(127.0.0.1:2117)'
+event: target status '127.0.0.1(127.0.0.1:2117)' from 'true' to 'false'
+unhealthy HTTP increment (1/3) for '127.0.0.1(127.0.0.1:2113)'
+unhealthy HTTP increment (2/3) for '127.0.0.1(127.0.0.1:2113)'
+unhealthy HTTP increment (3/3) for '127.0.0.1(127.0.0.1:2113)'
+event: target status '127.0.0.1(127.0.0.1:2113)' from 'true' to 'false'
 
 
 === TEST 2: report_failure() fails TCP active + passive
@@ -180,12 +180,12 @@ GET /t
 false
 false
 --- error_log
-unhealthy TCP increment (1/2) for '(127.0.0.1:2117)'
-unhealthy TCP increment (2/2) for '(127.0.0.1:2117)'
-event: target status '(127.0.0.1:2117)' from 'true' to 'false'
-unhealthy TCP increment (1/2) for '(127.0.0.1:2113)'
-unhealthy TCP increment (2/2) for '(127.0.0.1:2113)'
-event: target status '(127.0.0.1:2113)' from 'true' to 'false'
+unhealthy TCP increment (1/2) for '127.0.0.1(127.0.0.1:2117)'
+unhealthy TCP increment (2/2) for '127.0.0.1(127.0.0.1:2117)'
+event: target status '127.0.0.1(127.0.0.1:2117)' from 'true' to 'false'
+unhealthy TCP increment (1/2) for '127.0.0.1(127.0.0.1:2113)'
+unhealthy TCP increment (2/2) for '127.0.0.1(127.0.0.1:2113)'
+event: target status '127.0.0.1(127.0.0.1:2113)' from 'true' to 'false'
 
 
 === TEST 3: report_failure() is a nop when failure counters == 0
@@ -253,9 +253,9 @@ GET /t
 true
 true
 --- no_error_log
-unhealthy TCP increment (1/2) for '(127.0.0.1:2117)'
-unhealthy TCP increment (2/2) for '(127.0.0.1:2117)'
-event: target status '(127.0.0.1:2117)' from 'true' to 'false'
-unhealthy TCP increment (1/2) for '(127.0.0.1:2113)'
-unhealthy TCP increment (2/2) for '(127.0.0.1:2113)'
-event: target status '(127.0.0.1:2113)' from 'true' to 'false'
+unhealthy TCP increment (1/2) for '127.0.0.1(127.0.0.1:2117)'
+unhealthy TCP increment (2/2) for '127.0.0.1(127.0.0.1:2117)'
+event: target status '127.0.0.1(127.0.0.1:2117)' from 'true' to 'false'
+unhealthy TCP increment (1/2) for '127.0.0.1(127.0.0.1:2113)'
+unhealthy TCP increment (2/2) for '127.0.0.1(127.0.0.1:2113)'
+event: target status '127.0.0.1(127.0.0.1:2113)' from 'true' to 'false'

@@ -147,8 +147,8 @@ true
 true
 false
 --- error_log
-unhealthy HTTP increment (1/1) for '(127.0.0.1:2116)'
-event: target status '(127.0.0.1:2116)' from 'true' to 'false'
+unhealthy HTTP increment (1/1) for '127.0.0.1(127.0.0.1:2116)'
+event: target status '127.0.0.1(127.0.0.1:2116)' from 'true' to 'false'
 
 
 
@@ -293,7 +293,7 @@ false
 false
 false
 --- error_log
-unhealthy HTTP increment (1/1) for '(127.0.0.1:2118)'
-event: target status '(127.0.0.1:2118)' from 'true' to 'false'
+unhealthy HTTP increment (1/1) for '127.0.0.1(127.0.0.1:2118)'
+event: target status '127.0.0.1(127.0.0.1:2118)' from 'true' to 'false'
 unhealthy HTTP increment (1/1) for '127.0.0.1(127.0.0.1:2119)'
 event: target status '127.0.0.1(127.0.0.1:2119)' from 'true' to 'false'
