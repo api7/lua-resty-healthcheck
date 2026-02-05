@@ -186,7 +186,7 @@ qq{
             local checker = healthcheck.new({
                 name = name,
                 shm_name = shm_name,
-events_module = "resty.events",
+                events_module = "resty.events",
                 type = "http",
                 checks = {
                     active = {
