@@ -84,14 +84,14 @@ GET /t
 true
 true
 --- error_log
-healthy SUCCESS increment (1/3) for '(127.0.0.1:2116)'
-healthy SUCCESS increment (2/3) for '(127.0.0.1:2116)'
-healthy SUCCESS increment (3/3) for '(127.0.0.1:2116)'
-event: target status '(127.0.0.1:2116)' from 'false' to 'true'
-healthy SUCCESS increment (1/3) for '(127.0.0.1:2116)'
-healthy SUCCESS increment (2/3) for '(127.0.0.1:2116)'
-healthy SUCCESS increment (3/3) for '(127.0.0.1:2116)'
-event: target status '(127.0.0.1:2118)' from 'false' to 'true'
+healthy SUCCESS increment (1/3) for '127.0.0.1(127.0.0.1:2116)'
+healthy SUCCESS increment (2/3) for '127.0.0.1(127.0.0.1:2116)'
+healthy SUCCESS increment (3/3) for '127.0.0.1(127.0.0.1:2116)'
+event: target status '127.0.0.1(127.0.0.1:2116)' from 'false' to 'true'
+healthy SUCCESS increment (1/3) for '127.0.0.1(127.0.0.1:2116)'
+healthy SUCCESS increment (2/3) for '127.0.0.1(127.0.0.1:2116)'
+healthy SUCCESS increment (3/3) for '127.0.0.1(127.0.0.1:2116)'
+event: target status '127.0.0.1(127.0.0.1:2118)' from 'false' to 'true'
 
 
 === TEST 2: report_success() recovers TCP active = passive
@@ -159,14 +159,14 @@ GET /t
 true
 true
 --- error_log
-healthy SUCCESS increment (1/3) for '(127.0.0.1:2116)'
-healthy SUCCESS increment (2/3) for '(127.0.0.1:2116)'
-healthy SUCCESS increment (3/3) for '(127.0.0.1:2116)'
-event: target status '(127.0.0.1:2116)' from 'false' to 'true'
-healthy SUCCESS increment (1/3) for '(127.0.0.1:2116)'
-healthy SUCCESS increment (2/3) for '(127.0.0.1:2116)'
-healthy SUCCESS increment (3/3) for '(127.0.0.1:2116)'
-event: target status '(127.0.0.1:2118)' from 'false' to 'true'
+healthy SUCCESS increment (1/3) for '127.0.0.1(127.0.0.1:2116)'
+healthy SUCCESS increment (2/3) for '127.0.0.1(127.0.0.1:2116)'
+healthy SUCCESS increment (3/3) for '127.0.0.1(127.0.0.1:2116)'
+event: target status '127.0.0.1(127.0.0.1:2116)' from 'false' to 'true'
+healthy SUCCESS increment (1/3) for '127.0.0.1(127.0.0.1:2116)'
+healthy SUCCESS increment (2/3) for '127.0.0.1(127.0.0.1:2116)'
+healthy SUCCESS increment (3/3) for '127.0.0.1(127.0.0.1:2116)'
+event: target status '127.0.0.1(127.0.0.1:2118)' from 'false' to 'true'
 
 === TEST 3: report_success() is a nop when active.healthy.sucesses == 0
 --- http_config eval
@@ -228,7 +228,7 @@ GET /t
 false
 --- no_error_log
 healthy SUCCESS increment
-event: target status '127.0.0.1 (127.0.0.1:2116)' from 'false' to 'true'
+event: target status '127.0.0.1(127.0.0.1:2116)' from 'false' to 'true'
 
 
 
@@ -292,4 +292,4 @@ GET /t
 false
 --- no_error_log
 healthy SUCCESS increment
-event: target status '(127.0.0.1:2118)' from 'false' to 'true'
+event: target status '127.0.0.1(127.0.0.1:2118)' from 'false' to 'true'

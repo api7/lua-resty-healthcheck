@@ -755,6 +755,7 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
     return true
   end
 
+  hostname = hostname or ip
   port = tonumber(port)
   local target = get_target(self, ip, port, hostname)
   if not target then
@@ -979,6 +980,7 @@ function checker:set_target_status(ip, port, hostname, is_healthy)
   ip   = tostring(assert(ip, "no ip address provided"))
   port = assert(tonumber(port), "no port number provided")
   assert(type(is_healthy) == "boolean")
+  hostname = hostname or ip
 
   local health_report = is_healthy and "healthy" or "unhealthy"
 
