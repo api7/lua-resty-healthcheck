@@ -1063,16 +1063,32 @@ function checker:run_single_check(ip, port, hostname, hostheader)
   if self.checks.active.type == "https" then
     local https_sni, session, err
     https_sni = self.checks.active.https_sni or hostheader or hostname
-    if self.ssl_cert and self.ssl_key then
-      ok, err = sock:setclientcert(self.ssl_cert, self.ssl_key)
 
-      if not ok then
-        self:log(ERR, "failed to set client certificate: ", err)
+    if not sock.tlshandshake then
+        if self.ssl_cert and self.ssl_key then
+        ok, err = sock:setclientcert(self.ssl_cert, self.ssl_key)
+
+        if not ok then
+          self:log(ERR, "failed to set client certificate: ", err)
+        end
       end
-    end
+      self:log(DEBUG, "using sslhandshake")
+      session, err = sock:sslhandshake(nil, https_sni,
+                                      self.checks.active.https_verify_certificate)
+    else
+      local opts = {
+            reused_session = nil,
+            server_name = https_sni,
+            verify = self.checks.active.https_verify_certificate
+        }
 
-    session, err = sock:sslhandshake(nil, https_sni,
-                                     self.checks.active.https_verify_certificate)
+      if self.ssl_cert and self.ssl_key then
+          opts.client_cert = self.ssl_cert
+          opts.client_priv_key = self.ssl_key
+      end
+        self:log(DEBUG, "using tlshandshake")
+        session, err = sock:tlshandshake(opts)
+    end
 
     if not session then
       sock:close()
@@ -1551,6 +1567,20 @@ do
   end
 end
 
+
+local function check_valid_tlshandshake()
+    local sock, err = ngx.socket.tcp()
+    if not sock then
+        assert(false, "failed to create stream socket: " .. err)
+    end
+    if sock.tlshandshake then
+      ngx.log(ngx.ERR, type(sock.tlshandshake))
+      return true
+    else
+      return false
+    end
+end
+
 --- Creates a new health-checker instance.
 -- It will be started upon creation.
 --
@@ -1633,18 +1663,27 @@ function _M.new(opts)
 
   -- load certificate and key
   if opts.ssl_cert and opts.ssl_key then
-    if type(opts.ssl_cert) == "cdata" then
-      self.ssl_cert = opts.ssl_cert
-    else
-      self.ssl_cert = assert(ssl.parse_pem_cert(opts.ssl_cert))
-    end
+    if check_valid_tlshandshake() then   -- use tlshandshake mtls in apisix environment
+        if type(opts.ssl_cert) == "cdata" or type(opts.ssl_key) == "cdata" then
+          assert(false, "ssl_cert and ssl_key must be pem strings when using tlshandshake")  -- apisix route tls.certificate always string
+        end
 
-    if type(opts.ssl_key) == "cdata" then
-      self.ssl_key = opts.ssl_key
-    else
-      self.ssl_key = assert(ssl.parse_pem_priv_key(opts.ssl_key))
-    end
+        self.ssl_cert = opts.ssl_cert
+        self.ssl_key = opts.ssl_key
 
+    else  -- use sslhandshake
+      if type(opts.ssl_cert) == "cdata" then
+        self.ssl_cert = opts.ssl_cert
+      else
+        self.ssl_cert = assert(ssl.parse_pem_cert(opts.ssl_cert))
+      end
+
+      if type(opts.ssl_key) == "cdata" then
+        self.ssl_key = opts.ssl_key
+      else
+        self.ssl_key = assert(ssl.parse_pem_priv_key(opts.ssl_key))
+      end
+    end
   end
 
   -- other properties

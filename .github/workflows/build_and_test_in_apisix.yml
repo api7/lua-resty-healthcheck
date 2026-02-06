@@ -1,0 +1,62 @@
+name: Test-on-apisix
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        events_module:
+          - lua-resty-worker-events
+          - lua-resty-events
+
+    steps:
+    - name: Update and install OS dependencies
+      run: |
+        sudo apt-get update && sudo apt-get install -y luarocks cpanminus
+
+    - name: Install apisix environment
+      run: |
+        wget https://raw.githubusercontent.com/api7/apisix-build-tools/master/build-apisix-runtime.sh
+        chmod +x build-apisix-runtime.sh
+        ./build-apisix-runtime.sh
+
+    - uses: actions/checkout@v4
+      name: Checkout lua-resty-healthcheck
+
+    - name: Install luacheck dependencies
+      run: |
+        cd $GITHUB_WORKSPA
+        sudo luarocks install luacheck
+
+    - if: ${{ matrix.events_module == 'lua-resty-worker-events' }}
+      name: Install resty-worker-events dependencies
+      run: |
+        sudo luarocks install lua-resty-worker-events 1.0.0
+
+    - name: Install lua-resty-healthcheck dependencies
+      run: sudo luarocks install --only-deps lua-resty-healthcheck-scm-1.rockspec
+
+    - name: Install Test::NGINX
+      run: |
+        sudo apt-get install cpanminus
+        cpanm --notest --local-lib=$HOME/perl5 local::lib && eval $(perl -I $HOME/perl5/lib/perl5/ -Mlocal::lib)
+        cpanm --notest Test::Nginx
+        cpanm --notest Test::Nginx::Socket::Lua
+
+    - name: Run tests
+      env:
+        TEST_ENVIRONMENT: apisix
+      run: |
+        export OR_PREFIX="/usr/local/openresty"
+        export PATH=$OR_PREFIX/nginx/sbin:$OR_PREFIX/luajit/bin:$OR_PREFIX/bin:$PATH
+        echo "$PWD"
+        eval `luarocks path`
+        eval $(perl -I $HOME/perl5/lib/perl5/ -Mlocal::lib)
+        TEST_NGINX_RANDOMIZE=1 prove -I. -r t/apisix/${{ matrix.events_module }}/.
+
