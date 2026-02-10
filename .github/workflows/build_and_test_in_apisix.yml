@@ -8,7 +8,8 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: CI on apisix-environment
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         events_module:
@@ -44,7 +45,6 @@ jobs:
 
     - name: Install Test::NGINX
       run: |
-        sudo apt-get install cpanminus
         cpanm --notest --local-lib=$HOME/perl5 local::lib && eval $(perl -I $HOME/perl5/lib/perl5/ -Mlocal::lib)
         cpanm --notest Test::Nginx
         cpanm --notest Test::Nginx::Socket::Lua
