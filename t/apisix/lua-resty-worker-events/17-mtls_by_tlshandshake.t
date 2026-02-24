@@ -145,7 +145,7 @@ true
 using tlshandshake
 
 
-=== TEST 3: mtls check with unsupport parsed cert/key
+=== TEST 3: mtls check with unsupported parsed cert/key
 --- http_config eval
 qq{
     $::HttpConfig

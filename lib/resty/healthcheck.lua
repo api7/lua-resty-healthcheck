@@ -1072,6 +1072,7 @@ function checker:run_single_check(ip, port, hostname, hostheader)
           self:log(ERR, "failed to set client certificate: ", err)
         end
       end
+
       self:log(DEBUG, "using sslhandshake")
       session, err = sock:sslhandshake(nil, https_sni,
                                       self.checks.active.https_verify_certificate)
@@ -1086,8 +1087,9 @@ function checker:run_single_check(ip, port, hostname, hostheader)
           opts.client_cert = self.ssl_cert
           opts.client_priv_key = self.ssl_key
       end
-        self:log(DEBUG, "using tlshandshake")
-        session, err = sock:tlshandshake(opts)
+
+      self:log(DEBUG, "using tlshandshake")
+      session, err = sock:tlshandshake(opts)
     end
 
     if not session then
@@ -1571,14 +1573,10 @@ end
 local function check_valid_tlshandshake()
     local sock, err = ngx.socket.tcp()
     if not sock then
-        assert(false, "failed to create stream socket: " .. err)
+        assert(false, "failed to create cosockets: " .. err)
     end
-    if sock.tlshandshake then
-      ngx.log(ngx.ERR, type(sock.tlshandshake))
-      return true
-    else
-      return false
-    end
+
+    return type(sock.tlshandshake) == "function"
 end
 
 --- Creates a new health-checker instance.

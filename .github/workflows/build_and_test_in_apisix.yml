@@ -32,7 +32,7 @@ jobs:
 
     - name: Install luacheck dependencies
       run: |
-        cd $GITHUB_WORKSPA
+        cd $GITHUB_WORKSPACE
         sudo luarocks install luacheck
 
     - if: ${{ matrix.events_module == 'lua-resty-worker-events' }}
