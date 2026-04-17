@@ -1735,6 +1735,23 @@ function _M.new(opts)
       expire = function()
 
         if get_periodic_lock(shm, key) then
+          -- Check if there are any active checkers before renewing the lock.
+          -- When all checkers have been stopped (active=false), the lock holder
+          -- must release the lock so that other workers with active checkers
+          -- can acquire it.
+          local has_active_checker = false
+          for _, checker_obj in pairs(hcs) do
+            if checker_obj.checks.active.healthy.active or
+               checker_obj.checks.active.unhealthy.active then
+              has_active_checker = true
+              break
+            end
+          end
+          if not has_active_checker then
+            shm:delete(key)
+            active_check_timer.interval = CHECK_INTERVAL * 10
+            return
+          end
           active_check_timer.interval = CHECK_INTERVAL
           renew_periodic_lock(shm, key)
         else
