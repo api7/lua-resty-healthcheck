@@ -1734,26 +1734,35 @@ function _M.new(opts)
       detached = false,
       expire = function()
 
-        if get_periodic_lock(shm, key) then
-          -- Check whether any checker on this worker is still active before
-          -- renewing the lock. When every checker has been stopped
-          -- (active == false) the lock holder must release the lock so that
-          -- other workers which still own active checkers can acquire it,
-          -- otherwise active health checks become permanently stuck after a
-          -- disable -> re-enable cycle.
-          local has_active_checker = false
-          for _, checker_obj in pairs(hcs) do
-            if checker_obj.checks.active.healthy.active or
-               checker_obj.checks.active.unhealthy.active then
-              has_active_checker = true
-              break
-            end
+        -- A worker only contends for the periodic lock when it still owns at
+        -- least one active checker. Checking this *before* acquiring the lock
+        -- avoids a worker whose checkers were all disabled from repeatedly
+        -- re-acquiring and releasing the lock on every tick (the lock would
+        -- otherwise jitter once per back-off interval on a fully disabled
+        -- cluster). When every checker has been stopped the lock holder must
+        -- also release the lock so that other workers which still own active
+        -- checkers can acquire it, otherwise active health checks become
+        -- permanently stuck after a disable -> re-enable cycle.
+        local has_active_checker = false
+        for _, checker_obj in pairs(hcs) do
+          if checker_obj.checks.active.healthy.active or
+             checker_obj.checks.active.unhealthy.active then
+            has_active_checker = true
+            break
           end
-          if not has_active_checker then
+        end
+
+        if not has_active_checker then
+          -- release the lock only if we are still the holder, then back off
+          -- without contending again
+          if shm:get(key) == ngx_worker_pid() then
             shm:delete(key)
-            active_check_timer.interval = CHECK_INTERVAL * 10
-            return
           end
+          active_check_timer.interval = CHECK_INTERVAL * 10
+          return
+        end
+
+        if get_periodic_lock(shm, key) then
           active_check_timer.interval = CHECK_INTERVAL
           renew_periodic_lock(shm, key)
         else
