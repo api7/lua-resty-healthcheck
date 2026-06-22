@@ -7,10 +7,28 @@ plan tests => blocks() * 2;
 
 my $pwd = cwd();
 
+# A local self-signed TLS server is used instead of an external host so that
+# the active TLS probe tests are deterministic and do not depend on network
+# access. The certificate has CN/SAN "example.test"; probing with that
+# hostname (SNI) and certificate verification enabled succeeds, while probing
+# with a mismatching hostname and verification enabled fails.
+$ENV{TEST_NGINX_TLS_CERT} = "$pwd/t/with_worker-events/util/tls_probe_cert.pem";
+$ENV{TEST_NGINX_TLS_KEY} = "$pwd/t/with_worker-events/util/tls_probe_key.pem";
+
 our $HttpConfig = qq{
     lua_package_path "$pwd/lib/?.lua;;";
     lua_shared_dict test_shm 8m;
     lua_shared_dict my_worker_events 8m;
+
+    server {
+        listen 2115 ssl;
+        ssl_certificate $ENV{TEST_NGINX_TLS_CERT};
+        ssl_certificate_key $ENV{TEST_NGINX_TLS_KEY};
+        server_name example.test;
+        location / {
+            return 200 'ok';
+        }
+    }
 };
 
 run_tests();
@@ -23,7 +41,7 @@ __DATA__
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
-        lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        lua_ssl_trusted_certificate $TEST_NGINX_TLS_CERT;
         lua_ssl_verify_depth 2;
         content_by_lua_block {
             local we = require "resty.worker.events"
@@ -47,9 +65,9 @@ __DATA__
                     },
                 }
             })
-            local ok, err = checker:add_target("104.154.89.105", 443, "badssl.com", false)
+            local ok, err = checker:add_target("127.0.0.1", 2115, "example.test", false)
             ngx.sleep(8) -- wait for 4x the check interval
-            ngx.say(checker:get_target_status("104.154.89.105", 443, "badssl.com"))  -- true
+            ngx.say(checker:get_target_status("127.0.0.1", 2115, "example.test"))  -- true
         }
     }
 --- request
@@ -63,7 +81,7 @@ true
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
-        lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        lua_ssl_trusted_certificate $TEST_NGINX_TLS_CERT;
         lua_ssl_verify_depth 2;
         content_by_lua_block {
             local we = require "resty.worker.events"
@@ -87,9 +105,9 @@ true
                     },
                 }
             })
-            local ok, err = checker:add_target("104.154.89.105", 443, "wrong.host.badssl.com", true)
+            local ok, err = checker:add_target("127.0.0.1", 2115, "wrong.host.test", true)
             ngx.sleep(8) -- wait for 4x the check interval
-            ngx.say(checker:get_target_status("104.154.89.105", 443, "wrong.host.badssl.com"))  -- false
+            ngx.say(checker:get_target_status("127.0.0.1", 2115, "wrong.host.test"))  -- false
         }
     }
 --- request
@@ -103,7 +121,7 @@ false
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
-        lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        lua_ssl_trusted_certificate $TEST_NGINX_TLS_CERT;
         lua_ssl_verify_depth 2;
         content_by_lua_block {
             local we = require "resty.worker.events"
@@ -128,9 +146,9 @@ false
                     },
                 }
             })
-            local ok, err = checker:add_target("104.154.89.105", 443, "wrong.host.badssl.com", false)
+            local ok, err = checker:add_target("127.0.0.1", 2115, "wrong.host.test", false)
             ngx.sleep(8) -- wait for 4x the check interval
-            ngx.say(checker:get_target_status("104.154.89.105", 443, "wrong.host.badssl.com"))  -- true
+            ngx.say(checker:get_target_status("127.0.0.1", 2115, "wrong.host.test"))  -- true
         }
     }
 --- request
