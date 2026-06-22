@@ -1735,6 +1735,25 @@ function _M.new(opts)
       expire = function()
 
         if get_periodic_lock(shm, key) then
+          -- Check whether any checker on this worker is still active before
+          -- renewing the lock. When every checker has been stopped
+          -- (active == false) the lock holder must release the lock so that
+          -- other workers which still own active checkers can acquire it,
+          -- otherwise active health checks become permanently stuck after a
+          -- disable -> re-enable cycle.
+          local has_active_checker = false
+          for _, checker_obj in pairs(hcs) do
+            if checker_obj.checks.active.healthy.active or
+               checker_obj.checks.active.unhealthy.active then
+              has_active_checker = true
+              break
+            end
+          end
+          if not has_active_checker then
+            shm:delete(key)
+            active_check_timer.interval = CHECK_INTERVAL * 10
+            return
+          end
           active_check_timer.interval = CHECK_INTERVAL
           renew_periodic_lock(shm, key)
         else
@@ -1743,9 +1762,17 @@ function _M.new(opts)
         end
 
         local cur_time = ngx_now()
+        -- Decide once, before iterating the checkers, whether this is a
+        -- cleanup window. `last_cleanup_check` is module level and shared by
+        -- every checker, so it must be read before the loop and updated only
+        -- after it: updating it inside the loop would make the first checker
+        -- that runs cleanup advance the timestamp and starve every other
+        -- checker in `hcs`, leaving their purge-marked targets in the shm
+        -- forever. This only manifests with multiple health-checked upstreams.
+        local run_cleanup = (last_cleanup_check + CLEANUP_INTERVAL) < cur_time
         for _, checker_obj in pairs(hcs) do
 
-          if (last_cleanup_check + CLEANUP_INTERVAL) < cur_time then
+          if run_cleanup then
             -- clear targets marked for delayed removal
             locking_target_list(checker_obj, function(target_list)
               local removed_targets = {}
@@ -1774,8 +1801,6 @@ function _M.new(opts)
                 end
               end
             end)
-
-            last_cleanup_check = cur_time
           end
 
           if checker_obj.checks.active.healthy.active and
@@ -1793,6 +1818,12 @@ function _M.new(opts)
             checker_obj.checks.active.unhealthy.last_run = cur_time
             checker_callback(checker_obj, "unhealthy")
           end
+        end
+
+        -- Advance the cleanup window once, after every checker in `hcs` has
+        -- had a chance to purge its stale targets in this iteration.
+        if run_cleanup then
+          last_cleanup_check = cur_time
         end
       end,
     })
@@ -1865,6 +1896,16 @@ function _M.get_target_list(name, shm_name)
   end
 
   return self.targets
+end
+
+
+if TESTING then
+  -- test-only hook: shorten the stale-target cleanup window so the periodic
+  -- cleanup path can be exercised deterministically without waiting for the
+  -- default CLEANUP_INTERVAL (CHECK_INTERVAL * 25).
+  function _M._set_cleanup_interval(interval)
+    CLEANUP_INTERVAL = interval
+  end
 end
 
 
