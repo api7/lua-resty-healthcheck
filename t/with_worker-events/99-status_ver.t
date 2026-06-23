@@ -51,6 +51,9 @@ our $HttpConfig = qq{
             })
 
             local my_id = ngx.worker.id()
+            local deadline = ngx.now() + 5  -- bound the barrier wait so a
+                                            -- missing worker fails loudly
+                                            -- instead of spinning forever
             while true do
                 we.post("barrier", "ping", my_id)
                 we.poll()
@@ -62,6 +65,11 @@ our $HttpConfig = qq{
                 end
                 if seen >= worker_count then
                     break
+                end
+                ngx.update_time()
+                if ngx.now() >= deadline then
+                    error("barrier not reached: " .. seen .. "/" ..
+                          worker_count .. " workers synced before timeout")
                 end
                 ngx.sleep(0.05)
             end
