@@ -71,9 +71,8 @@ __DATA__
             end
 
             -- no active checker exists on this worker
-            ngx.say("has active: ",
-                checker.checks.active.healthy.active or
-                checker.checks.active.unhealthy.active)
+            ngx.say("has active: ", not not (checker.checks.active.healthy.active or
+                                  checker.checks.active.unhealthy.active))
 
             -- mark every target for immediate delayed removal
             assert(checker:delayed_clear(0))
