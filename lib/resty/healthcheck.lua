@@ -1734,54 +1734,27 @@ function _M.new(opts)
       detached = false,
       expire = function()
 
-        -- A worker only contends for the periodic lock when it still owns at
-        -- least one active checker. Checking this *before* acquiring the lock
-        -- avoids a worker whose checkers were all disabled from repeatedly
-        -- re-acquiring and releasing the lock on every tick (the lock would
-        -- otherwise jitter once per back-off interval on a fully disabled
-        -- cluster). When every checker has been stopped the lock holder must
-        -- also release the lock so that other workers which still own active
-        -- checkers can acquire it, otherwise active health checks become
-        -- permanently stuck after a disable -> re-enable cycle.
-        local has_active_checker = false
-        for _, checker_obj in pairs(hcs) do
-          if checker_obj.checks.active.healthy.active or
-             checker_obj.checks.active.unhealthy.active then
-            has_active_checker = true
-            break
-          end
-        end
-
-        if not has_active_checker then
-          -- release the lock only if we are still the holder, then back off
-          -- without contending again
-          if shm:get(key) == ngx_worker_pid() then
-            shm:delete(key)
-          end
-          active_check_timer.interval = CHECK_INTERVAL * 10
-          return
-        end
-
-        if get_periodic_lock(shm, key) then
-          active_check_timer.interval = CHECK_INTERVAL
-          renew_periodic_lock(shm, key)
-        else
-          active_check_timer.interval = CHECK_INTERVAL * 10
-          return
-        end
-
         local cur_time = ngx_now()
-        -- Decide once, before iterating the checkers, whether this is a
-        -- cleanup window. `last_cleanup_check` is module level and shared by
-        -- every checker, so it must be read before the loop and updated only
-        -- after it: updating it inside the loop would make the first checker
-        -- that runs cleanup advance the timestamp and starve every other
-        -- checker in `hcs`, leaving their purge-marked targets in the shm
+
+        -- Stale-target cleanup is decoupled from both active probing and the
+        -- periodic lock. A passive-only deployment (checks.passive but no
+        -- active interval) has no active checker on any worker, yet still marks
+        -- targets via delayed_clear() and must purge them; gating cleanup on
+        -- the periodic lock (which only an active worker ever holds) would leak
+        -- those targets forever (apache/apisix#13385). Cleanup is therefore run
+        -- independently here: locking_target_list serializes the purge across
+        -- workers and re-reads the shm list each time, so running it on every
+        -- worker is safe and idempotent -- a worker that finds the list already
+        -- purged removes nothing and raises no duplicate remove event.
+        --
+        -- `run_cleanup` is decided once, before the loop, and last_cleanup_check
+        -- advanced once after it: last_cleanup_check is module level and shared
+        -- by every checker, so advancing it inside the loop would let the first
+        -- checker starve the rest, leaving their purge-marked targets in the shm
         -- forever. This only manifests with multiple health-checked upstreams.
         local run_cleanup = (last_cleanup_check + CLEANUP_INTERVAL) < cur_time
-        for _, checker_obj in pairs(hcs) do
-
-          if run_cleanup then
+        if run_cleanup then
+          for _, checker_obj in pairs(hcs) do
             -- clear targets marked for delayed removal
             locking_target_list(checker_obj, function(target_list)
               local removed_targets = {}
@@ -1811,7 +1784,46 @@ function _M.new(opts)
               end
             end)
           end
+          last_cleanup_check = cur_time
+        end
 
+        -- The periodic lock distributes ACTIVE probing to a single worker. A
+        -- worker with no active checker must release the lock (if it holds it)
+        -- and back off, so a worker that still owns active checkers can take
+        -- over; otherwise active health checks stay stuck after a disable ->
+        -- re-enable cycle (apache/apisix#13235). This is gated on
+        -- has_active_checker rather than on `hcs` being non-empty, because a
+        -- disabled checker lingers in the weak `hcs` table with active=false
+        -- until it is garbage collected.
+        local has_active_checker = false
+        for _, checker_obj in pairs(hcs) do
+          if checker_obj.checks.active.healthy.active or
+             checker_obj.checks.active.unhealthy.active then
+            has_active_checker = true
+            break
+          end
+        end
+
+        if not has_active_checker then
+          -- release the lock only if we are still the holder, then back off
+          -- without contending again
+          if shm:get(key) == ngx_worker_pid() then
+            shm:delete(key)
+          end
+          active_check_timer.interval = CHECK_INTERVAL * 10
+          return
+        end
+
+        if get_periodic_lock(shm, key) then
+          active_check_timer.interval = CHECK_INTERVAL
+          renew_periodic_lock(shm, key)
+        else
+          active_check_timer.interval = CHECK_INTERVAL * 10
+          return
+        end
+
+        -- active probing: only the periodic-lock holder runs the probes
+        for _, checker_obj in pairs(hcs) do
           if checker_obj.checks.active.healthy.active and
             (checker_obj.checks.active.healthy.last_run +
               checker_obj.checks.active.healthy.interval <= cur_time)
@@ -1827,12 +1839,6 @@ function _M.new(opts)
             checker_obj.checks.active.unhealthy.last_run = cur_time
             checker_callback(checker_obj, "unhealthy")
           end
-        end
-
-        -- Advance the cleanup window once, after every checker in `hcs` has
-        -- had a chance to purge its stale targets in this iteration.
-        if run_cleanup then
-          last_cleanup_check = cur_time
         end
       end,
     })
