@@ -236,7 +236,6 @@ local hcs = setmetatable({}, {
 })
 
 local active_check_timer
-local last_cleanup_check
 
 -- serialize a table to a string
 local serialize = codec.encode
@@ -1423,6 +1422,15 @@ function checker:start()
   worker_events.unregister(self.ev_callback, self.EVENT_SOURCE)  -- ensure we never double subscribe
   worker_events.register_weak(self.ev_callback, self.EVENT_SOURCE)
 
+  -- If the active-check timer is already running but backed off (idle worker,
+  -- or one that lost the periodic-lock race, runs at CHECK_INTERVAL * 10),
+  -- wake it up so a freshly (re-)enabled checker resumes probing promptly
+  -- instead of waiting up to one slow tick.
+  if active_check_timer and
+     (self.checks.active.healthy.active or self.checks.active.unhealthy.active) then
+    active_check_timer.interval = CHECK_INTERVAL
+  end
+
   self:log(DEBUG, "active check flagged as active")
   return true
 end
@@ -1726,7 +1734,7 @@ function _M.new(opts)
     self:log(DEBUG, "worker ", ngx_worker_id(), " (pid: ", ngx_worker_pid(), ") ",
       "starting active check timer")
     local shm, key = self.shm, self.PERIODIC_LOCK
-    last_cleanup_check = ngx_now()
+    local cleanup_key = key .. ":cleanup"
     active_check_timer, err = resty_timer({
       recurring = true,
       interval = CHECK_INTERVAL,
@@ -1736,24 +1744,20 @@ function _M.new(opts)
 
         local cur_time = ngx_now()
 
-        -- Stale-target cleanup is decoupled from both active probing and the
+        -- Stale-target cleanup is decoupled from active probing and the
         -- periodic lock. A passive-only deployment (checks.passive but no
         -- active interval) has no active checker on any worker, yet still marks
         -- targets via delayed_clear() and must purge them; gating cleanup on
         -- the periodic lock (which only an active worker ever holds) would leak
-        -- those targets forever (apache/apisix#13385). Cleanup is therefore run
-        -- independently here: locking_target_list serializes the purge across
-        -- workers and re-reads the shm list each time, so running it on every
-        -- worker is safe and idempotent -- a worker that finds the list already
-        -- purged removes nothing and raises no duplicate remove event.
+        -- those targets forever (apache/apisix#13385).
         --
-        -- `run_cleanup` is decided once, before the loop, and last_cleanup_check
-        -- advanced once after it: last_cleanup_check is module level and shared
-        -- by every checker, so advancing it inside the loop would let the first
-        -- checker starve the rest, leaving their purge-marked targets in the shm
-        -- forever. This only manifests with multiple health-checked upstreams.
-        local run_cleanup = (last_cleanup_check + CLEANUP_INTERVAL) < cur_time
-        if run_cleanup then
+        -- A single worker per window is elected via an atomic shm:add on
+        -- cleanup_key (TTL = CLEANUP_INTERVAL): any worker can win, including a
+        -- passive-only one, so the leak fix holds, while the other workers skip
+        -- the pass and do not all contend on each checker's TARGET_LIST_LOCK.
+        -- The elected worker purges every checker in one pass.
+        local won, add_err = shm:add(cleanup_key, ngx_worker_pid(), CLEANUP_INTERVAL)
+        if won then
           for _, checker_obj in pairs(hcs) do
             -- clear targets marked for delayed removal
             locking_target_list(checker_obj, function(target_list)
@@ -1784,7 +1788,8 @@ function _M.new(opts)
               end
             end)
           end
-          last_cleanup_check = cur_time
+        elseif add_err ~= "exists" then
+          ngx_log(ERR, "failed to elect cleanup worker for '", cleanup_key, "': ", add_err)
         end
 
         -- The periodic lock distributes ACTIVE probing to a single worker. A
