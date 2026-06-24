@@ -1422,15 +1422,6 @@ function checker:start()
   worker_events.unregister(self.ev_callback, self.EVENT_SOURCE)  -- ensure we never double subscribe
   worker_events.register_weak(self.ev_callback, self.EVENT_SOURCE)
 
-  -- If the active-check timer is already running but backed off (idle worker,
-  -- or one that lost the periodic-lock race, runs at CHECK_INTERVAL * 10),
-  -- wake it up so a freshly (re-)enabled checker resumes probing promptly
-  -- instead of waiting up to one slow tick.
-  if active_check_timer and
-     (self.checks.active.healthy.active or self.checks.active.unhealthy.active) then
-    active_check_timer.interval = CHECK_INTERVAL
-  end
-
   self:log(DEBUG, "active check flagged as active")
   return true
 end
