@@ -1746,7 +1746,12 @@ function _M.new(opts)
         -- cleanup_key (TTL = CLEANUP_INTERVAL): any worker can win, including a
         -- passive-only one, so the leak fix holds, while the other workers skip
         -- the pass and do not all contend on each checker's TARGET_LIST_LOCK.
-        -- The elected worker purges every checker in one pass.
+        -- The elected worker purges every checker in its own `hcs` in one pass.
+        -- Purging writes to the shared shm target_list, so cleaning a checker on
+        -- any one worker is globally effective; if checkers are distributed
+        -- asymmetrically across workers, a given upstream is purged in whichever
+        -- window a worker that owns its checker wins the election -- eventually
+        -- consistent rather than every-worker-every-window.
         local won, add_err = shm:add(cleanup_key, ngx_worker_pid(), CLEANUP_INTERVAL)
         if won then
           for _, checker_obj in pairs(hcs) do
@@ -1801,20 +1806,17 @@ function _M.new(opts)
         end
 
         if not has_active_checker then
-          -- release the lock only if we are still the holder, then back off
-          -- without contending again
+          -- release the lock only if we are still the holder, so a worker that
+          -- still owns active checkers can take over
           if shm:get(key) == ngx_worker_pid() then
             shm:delete(key)
           end
-          active_check_timer.interval = CHECK_INTERVAL * 10
           return
         end
 
         if get_periodic_lock(shm, key) then
-          active_check_timer.interval = CHECK_INTERVAL
           renew_periodic_lock(shm, key)
         else
-          active_check_timer.interval = CHECK_INTERVAL * 10
           return
         end
 
