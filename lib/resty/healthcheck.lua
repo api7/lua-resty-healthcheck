@@ -236,7 +236,6 @@ local hcs = setmetatable({}, {
 })
 
 local active_check_timer
-local last_cleanup_check
 
 -- serialize a table to a string
 local serialize = codec.encode
@@ -1726,7 +1725,7 @@ function _M.new(opts)
     self:log(DEBUG, "worker ", ngx_worker_id(), " (pid: ", ngx_worker_pid(), ") ",
       "starting active check timer")
     local shm, key = self.shm, self.PERIODIC_LOCK
-    last_cleanup_check = ngx_now()
+    local cleanup_key = key .. ":cleanup"
     active_check_timer, err = resty_timer({
       recurring = true,
       interval = CHECK_INTERVAL,
@@ -1734,18 +1733,28 @@ function _M.new(opts)
       detached = false,
       expire = function()
 
-        if get_periodic_lock(shm, key) then
-          active_check_timer.interval = CHECK_INTERVAL
-          renew_periodic_lock(shm, key)
-        else
-          active_check_timer.interval = CHECK_INTERVAL * 10
-          return
-        end
-
         local cur_time = ngx_now()
-        for _, checker_obj in pairs(hcs) do
 
-          if (last_cleanup_check + CLEANUP_INTERVAL) < cur_time then
+        -- Stale-target cleanup is decoupled from active probing and the
+        -- periodic lock. A passive-only deployment (checks.passive but no
+        -- active interval) has no active checker on any worker, yet still marks
+        -- targets via delayed_clear() and must purge them; gating cleanup on
+        -- the periodic lock (which only an active worker ever holds) would leak
+        -- those targets forever (apache/apisix#13385).
+        --
+        -- A single worker per window is elected via an atomic shm:add on
+        -- cleanup_key (TTL = CLEANUP_INTERVAL): any worker can win, including a
+        -- passive-only one, so the leak fix holds, while the other workers skip
+        -- the pass and do not all contend on each checker's TARGET_LIST_LOCK.
+        -- The elected worker purges every checker in its own `hcs` in one pass.
+        -- Purging writes to the shared shm target_list, so cleaning a checker on
+        -- any one worker is globally effective; if checkers are distributed
+        -- asymmetrically across workers, a given upstream is purged in whichever
+        -- window a worker that owns its checker wins the election -- eventually
+        -- consistent rather than every-worker-every-window.
+        local won, add_err = shm:add(cleanup_key, ngx_worker_pid(), CLEANUP_INTERVAL)
+        if won then
+          for _, checker_obj in pairs(hcs) do
             -- clear targets marked for delayed removal
             locking_target_list(checker_obj, function(target_list)
               local removed_targets = {}
@@ -1774,10 +1783,45 @@ function _M.new(opts)
                 end
               end
             end)
-
-            last_cleanup_check = cur_time
           end
+        elseif add_err ~= "exists" then
+          ngx_log(ERR, "failed to elect cleanup worker for '", cleanup_key, "': ", add_err)
+        end
 
+        -- The periodic lock distributes ACTIVE probing to a single worker. A
+        -- worker with no active checker must release the lock (if it holds it)
+        -- and back off, so a worker that still owns active checkers can take
+        -- over; otherwise active health checks stay stuck after a disable ->
+        -- re-enable cycle (apache/apisix#13235). This is gated on
+        -- has_active_checker rather than on `hcs` being non-empty, because a
+        -- disabled checker lingers in the weak `hcs` table with active=false
+        -- until it is garbage collected.
+        local has_active_checker = false
+        for _, checker_obj in pairs(hcs) do
+          if checker_obj.checks.active.healthy.active or
+             checker_obj.checks.active.unhealthy.active then
+            has_active_checker = true
+            break
+          end
+        end
+
+        if not has_active_checker then
+          -- release the lock only if we are still the holder, so a worker that
+          -- still owns active checkers can take over
+          if shm:get(key) == ngx_worker_pid() then
+            shm:delete(key)
+          end
+          return
+        end
+
+        if get_periodic_lock(shm, key) then
+          renew_periodic_lock(shm, key)
+        else
+          return
+        end
+
+        -- active probing: only the periodic-lock holder runs the probes
+        for _, checker_obj in pairs(hcs) do
           if checker_obj.checks.active.healthy.active and
             (checker_obj.checks.active.healthy.last_run +
               checker_obj.checks.active.healthy.interval <= cur_time)
@@ -1865,6 +1909,16 @@ function _M.get_target_list(name, shm_name)
   end
 
   return self.targets
+end
+
+
+if TESTING then
+  -- test-only hook: shorten the stale-target cleanup window so the periodic
+  -- cleanup path can be exercised deterministically without waiting for the
+  -- default CLEANUP_INTERVAL (CHECK_INTERVAL * 25).
+  function _M._set_cleanup_interval(interval)
+    CLEANUP_INTERVAL = interval
+  end
 end
 
 
