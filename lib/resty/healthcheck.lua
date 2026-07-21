@@ -1117,9 +1117,11 @@ function checker:run_single_check(ip, port, hostname, hostheader)
   local method = self.checks.active.http_method
   local path = self.checks.active.http_path
   local body = self.checks.active.http_req_body
-  -- guard against a misconfigured non-string method/body reaching string.format
-  -- or the length operator, which would throw and abort the active-check thread
+  -- guard against a misconfigured non-string method/path/body reaching
+  -- string.format or the length operator, which would throw and abort the
+  -- active-check thread
   if type(method) ~= "string" then method = "GET" end
+  if type(path) ~= "string" then path = "/" end
   if type(body) ~= "string" then body = "" end
   local final_hostheader = hostheader or hostname or ip
   local head = ("%s %s HTTP/1.1\r\nConnection: close\r\n%sHost: %s\r\n")
