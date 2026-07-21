@@ -1117,25 +1117,16 @@ function checker:run_single_check(ip, port, hostname, hostheader)
   local method = self.checks.active.http_method
   local path = self.checks.active.http_path
   local body = self.checks.active.http_req_body
-  -- guard against a misconfigured non-string method/path/body reaching
-  -- string.format or the length operator, which would throw and abort the
-  -- active-check thread
-  if type(method) ~= "string" then method = "GET" end
-  if type(path) ~= "string" then path = "/" end
-  if type(body) ~= "string" then body = "" end
   local final_hostheader = hostheader or hostname or ip
-  local head = ("%s %s HTTP/1.1\r\nConnection: close\r\n%sHost: %s\r\n")
-               :format(method, path, headers, final_hostheader)
   local request
-  if #body > 0 then
-    head = head .. ("Content-Length: %d\r\n"):format(#body)
-    request = head .. "\r\n" .. body
+  if body and #body > 0 then
+    request = ("%s %s HTTP/1.1\r\nConnection: close\r\n%sHost: %s\r\nContent-Length: %d\r\n\r\n%s")
+              :format(method, path, headers, final_hostheader, #body, body)
   else
-    request = head .. "\r\n"
+    request = ("%s %s HTTP/1.1\r\nConnection: close\r\n%sHost: %s\r\n\r\n")
+              :format(method, path, headers, final_hostheader)
   end
-  -- log the request head only (method, path, headers, Host, Content-Length),
-  -- never the body, which may carry credentials or PII
-  self:log(DEBUG, "request head: ", head)
+  self:log(DEBUG, "request: ", request)
 
   local bytes
   bytes, err = sock:send(request)
