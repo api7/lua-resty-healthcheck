@@ -23,7 +23,12 @@ qq{
     server {
         listen 2112;
         location = /status {
-            return 200;
+            content_by_lua_block {
+                ngx.req.read_body()
+                ngx.log(ngx.WARN, "probe received method=", ngx.req.get_method(),
+                        " body=", ngx.req.get_body_data() or "")
+                ngx.exit(200)
+            }
         }
     }
 }
@@ -59,10 +64,8 @@ GET /t
 true
 --- error_log
 POST /status HTTP/1.1
-Connection: close
 Content-Length: 13
-
-{"ping":true}
+probe received method=POST body={"ping":true}
 
 
 === TEST 2: default method is GET with no body and no Content-Length
@@ -73,7 +76,12 @@ qq{
     server {
         listen 2112;
         location = /status {
-            return 200;
+            content_by_lua_block {
+                ngx.req.read_body()
+                ngx.log(ngx.WARN, "probe received method=", ngx.req.get_method(),
+                        " body=", ngx.req.get_body_data() or "")
+                ngx.exit(200)
+            }
         }
     }
 }
@@ -107,5 +115,6 @@ GET /t
 true
 --- error_log
 GET /status HTTP/1.1
+probe received method=GET body=
 --- no_error_log
 Content-Length:
