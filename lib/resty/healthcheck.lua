@@ -1397,28 +1397,55 @@ function checker:event_handler(event_name, ip, port, hostname)
 end
 
 
+-- Remove a target from a checker's local cache only (self.targets), mirroring
+-- event_handler's own `events.remove` branch exactly (nested lookup table +
+-- array part), but without touching shm -- the shm side is already
+-- authoritative and, in the case this is called for, already has this target
+-- removed from it.
+local function remove_local_target(checker_obj, ip, port, hostname)
+  checker_obj.targets[ip][port][hostname] = nil
+  if not next(checker_obj.targets[ip][port]) then
+    checker_obj.targets[ip][port] = nil
+  end
+  if not next(checker_obj.targets[ip]) then
+    checker_obj.targets[ip] = nil
+  end
+  for i, t in ipairs(checker_obj.targets) do
+    if t.ip == ip and t.port == port and t.hostname == hostname then
+      table_remove(checker_obj.targets, i)
+      break
+    end
+  end
+end
+
+
 -- Re-derive a checker's local internal_health for every target the shm target
 -- list says exists, correcting any target whose cached value has drifted from
 -- a worker_events broadcast this worker never received (apache/apisix#13888),
--- AND backfilling any target this worker's self.targets never even contains
--- an entry for at all.
+-- backfilling any target this worker's self.targets never even contains an
+-- entry for at all, AND dropping any local target that shm no longer knows
+-- about (a missed `remove` broadcast is the same single-event, no-resend
+-- mechanism as a missed healthy/unhealthy one, and remove_target() mutates
+-- shm directly, exactly like incr_counter does for health state).
 --
--- The second case is not hypothetical: add_target()'s "already exists in shm"
--- branch (see its own comment) returns early without ever calling raise_event,
--- so a worker whose *own* add_target call loses that race gets no event either
--- -- and if this worker's initial checker.new() read of the target list also
--- raced ahead of the writer (observed directly: "Got initial target list (0
--- targets)" immediately followed by "adding an existing target ... (ignoring)"
--- for every target), self.targets ends up with no entry for that target at
--- all: not stale, structurally absent. Since checker_callback() only ever
--- looks a target up via get_target(self, ...) against this same self.targets,
--- such a target is permanently invisible to this worker's active-check cycle
--- -- if this worker also holds the periodic probe lock (which never
--- voluntarily rotates), NO worker ever probes that target again for the life
--- of the process. Sourcing this sweep from fetch_target_list() (shm, the
--- authoritative source used across the file, e.g. add_target/checker_callback
--- itself) instead of iterating self.targets directly is what lets a missing
--- entry be detected in the first place.
+-- The missing-target case is not hypothetical: add_target()'s "already exists
+-- in shm" branch (see its own comment) returns early without ever calling
+-- raise_event, so a worker whose *own* add_target call loses that race gets
+-- no event either -- and if this worker's initial checker.new() read of the
+-- target list also raced ahead of the writer (observed directly: "Got
+-- initial target list (0 targets)" immediately followed by "adding an
+-- existing target ... (ignoring)" for every target), self.targets ends up
+-- with no entry for that target at all: not stale, structurally absent.
+-- Since checker_callback() only ever looks a target up via get_target(self,
+-- ...) against this same self.targets, such a target is permanently
+-- invisible to this worker's active-check cycle -- if this worker also holds
+-- the periodic probe lock (which never voluntarily rotates), NO worker ever
+-- probes that target again for the life of the process. Sourcing this sweep
+-- from fetch_target_list() (shm, the authoritative source used across the
+-- file, e.g. add_target/checker_callback itself) instead of iterating
+-- self.targets directly is what lets a missing entry be detected in the
+-- first place, and is symmetrically what lets a stale local entry (removed
+-- from shm, never removed locally) be detected too.
 local function reconcile_target_health(checker_obj)
   local targets, err = fetch_target_list(checker_obj)
   if not targets then
@@ -1426,7 +1453,14 @@ local function reconcile_target_health(checker_obj)
     return
   end
 
+  -- authoritative set of target keys shm currently knows about, used below to
+  -- find local entries that shm no longer has (a missed `remove` broadcast)
+  local shm_keys = new_tab(0, #targets)
+
   for _, target in ipairs(targets) do
+    local hostname = target.hostname or target.ip
+    shm_keys[target.ip .. ":" .. target.port .. ":" .. hostname] = true
+
     local state_key = key_for(checker_obj.TARGET_STATE, target.ip, target.port,
                                target.hostname)
     local raw_state = checker_obj.shm:get(state_key)
@@ -1443,14 +1477,24 @@ local function reconcile_target_health(checker_obj)
           -- must add it first" branch -- keeps both the ip/port/hostname
           -- lookup table and the array part (used elsewhere, e.g. remove)
           -- consistent with how every other insertion path populates them.
-          target_found = { ip = target.ip, port = target.port,
-                            hostname = target.hostname or target.ip }
+          target_found = { ip = target.ip, port = target.port, hostname = hostname }
           checker_obj.targets[target_found.ip] = checker_obj.targets[target_found.ip] or {}
           checker_obj.targets[target_found.ip][target_found.port] =
             checker_obj.targets[target_found.ip][target_found.port] or {}
           checker_obj.targets[target_found.ip][target_found.port][target_found.hostname] =
             target_found
           checker_obj.targets[#checker_obj.targets + 1] = target_found
+
+          -- Mirror event_handler's boundary check: a target with no local
+          -- entry at all was not routable (get_target_status() returns
+          -- "target not found", never true), so backfilling it as healthy or
+          -- mostly_healthy is itself a not-routable -> routable transition a
+          -- consumer's cached routing view needs to know about.
+          local to = shm_health == "healthy" or shm_health == "mostly_healthy"
+          if to then
+            checker_obj.status_ver = checker_obj.status_ver + 1
+          end
+
           checker_obj:log(WARN, "reconciled missing target from shm (never seen locally) '",
                           target_found.hostname or "", "(", target_found.ip, ":",
                           target_found.port, ")' as '", shm_health, "'")
@@ -1469,6 +1513,37 @@ local function reconcile_target_health(checker_obj)
         target_found.internal_health = shm_health
       end
     end
+  end
+
+  -- Drop local targets shm no longer has at all -- a missed `remove` event is
+  -- the same single-shot, no-resend gap as a missed health-state event, and
+  -- get_target_status() returning stale "true" for a target already removed
+  -- from shm is a live routing bug, not just a cosmetic cache mismatch.
+  -- Iterate a snapshot of the array part since remove_local_target() mutates
+  -- it in place.
+  local stale = {}
+  for _, t in ipairs(checker_obj.targets) do
+    local hostname = t.hostname or t.ip
+    if not shm_keys[t.ip .. ":" .. t.port .. ":" .. hostname] then
+      stale[#stale + 1] = { ip = t.ip, port = t.port, hostname = hostname }
+    end
+  end
+  for _, t in ipairs(stale) do
+    -- a removal always moves a target off the routable side for whichever
+    -- boundary check consumers rely on (get_target_status returns
+    -- "target not found" afterwards, never true), so bump status_ver whenever
+    -- the target being dropped was still on the routable side locally.
+    local target_found = get_target(checker_obj, t.ip, t.port, t.hostname)
+    if target_found then
+      local from = target_found.internal_health == "healthy" or
+                   target_found.internal_health == "mostly_healthy"
+      if from then
+        checker_obj.status_ver = checker_obj.status_ver + 1
+      end
+    end
+    remove_local_target(checker_obj, t.ip, t.port, t.hostname)
+    checker_obj:log(WARN, "reconciled stale local target no longer in shm (missed remove event) '",
+                    t.hostname or "", "(", t.ip, ":", t.port, ")'")
   end
 end
 

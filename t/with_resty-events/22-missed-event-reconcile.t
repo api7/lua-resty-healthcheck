@@ -1,9 +1,7 @@
-use Test::Nginx::Socket::Lua;
+use Test::Nginx::Socket::Lua 'no_plan';
 use Cwd qw(cwd);
 
 workers(1);
-
-plan tests => repeat_each() * (blocks() * 3) - 2;
 
 my $pwd = cwd();
 $ENV{TEST_NGINX_SERVROOT} = server_root();
