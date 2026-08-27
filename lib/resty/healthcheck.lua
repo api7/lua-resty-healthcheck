@@ -142,6 +142,16 @@ local CHECK_JITTER = CHECK_INTERVAL * 0.1
 -- the check interval. If it does not update the shm during this period, we
 -- consider that it is not able to continue checking (the worker probably was killed)
 local LOCK_PERIOD = CHECK_INTERVAL * 15
+
+-- Only the periodic-lock holder ever runs active probes (see active_check_timer
+-- below), so every other worker's target.internal_health is updated *solely* by
+-- the worker_events broadcast raised in incr_counter. That broadcast has no
+-- delivery guarantee and, once a target is already at the reported health, is
+-- never raised again for the same state -- so a single missed event permanently
+-- strands a worker's local view (apache/apisix#13888). RECONCILE_INTERVAL bounds
+-- how long that divergence can last: every worker re-derives internal_health
+-- from the authoritative shm state on this cadence, independent of events.
+local RECONCILE_INTERVAL = 1
 -- interval between stale targets cleanup
 local CLEANUP_INTERVAL = CHECK_INTERVAL * 25
 
@@ -236,6 +246,10 @@ local hcs = setmetatable({}, {
 })
 
 local active_check_timer
+
+-- last time (ngx.now()) the shm-vs-local-cache reconciliation sweep ran; shared
+-- by all checkers on this worker since the sweep itself iterates `hcs`
+local last_reconcile_time = 0
 
 -- serialize a table to a string
 local serialize = codec.encode
@@ -1383,6 +1397,82 @@ function checker:event_handler(event_name, ip, port, hostname)
 end
 
 
+-- Re-derive a checker's local internal_health for every target the shm target
+-- list says exists, correcting any target whose cached value has drifted from
+-- a worker_events broadcast this worker never received (apache/apisix#13888),
+-- AND backfilling any target this worker's self.targets never even contains
+-- an entry for at all.
+--
+-- The second case is not hypothetical: add_target()'s "already exists in shm"
+-- branch (see its own comment) returns early without ever calling raise_event,
+-- so a worker whose *own* add_target call loses that race gets no event either
+-- -- and if this worker's initial checker.new() read of the target list also
+-- raced ahead of the writer (observed directly: "Got initial target list (0
+-- targets)" immediately followed by "adding an existing target ... (ignoring)"
+-- for every target), self.targets ends up with no entry for that target at
+-- all: not stale, structurally absent. Since checker_callback() only ever
+-- looks a target up via get_target(self, ...) against this same self.targets,
+-- such a target is permanently invisible to this worker's active-check cycle
+-- -- if this worker also holds the periodic probe lock (which never
+-- voluntarily rotates), NO worker ever probes that target again for the life
+-- of the process. Sourcing this sweep from fetch_target_list() (shm, the
+-- authoritative source used across the file, e.g. add_target/checker_callback
+-- itself) instead of iterating self.targets directly is what lets a missing
+-- entry be detected in the first place.
+local function reconcile_target_health(checker_obj)
+  local targets, err = fetch_target_list(checker_obj)
+  if not targets then
+    checker_obj:log(ERR, "reconcile: failed to fetch target list from shm: ", err)
+    return
+  end
+
+  for _, target in ipairs(targets) do
+    local state_key = key_for(checker_obj.TARGET_STATE, target.ip, target.port,
+                               target.hostname)
+    local raw_state = checker_obj.shm:get(state_key)
+    -- add_target() always writes TARGET_STATE before a target is considered
+    -- live (see its comment), so nil here means this read raced a concurrent
+    -- add/remove, not a genuine absence of state -- skip it for this sweep,
+    -- it will be consistent again on the next one.
+    if raw_state ~= nil then
+      local shm_health = INTERNAL_STATES[raw_state]
+      if shm_health then
+        local target_found = get_target(checker_obj, target.ip, target.port, target.hostname)
+        if not target_found then
+          -- lazily insert, mirroring event_handler's own "it is a new target,
+          -- must add it first" branch -- keeps both the ip/port/hostname
+          -- lookup table and the array part (used elsewhere, e.g. remove)
+          -- consistent with how every other insertion path populates them.
+          target_found = { ip = target.ip, port = target.port,
+                            hostname = target.hostname or target.ip }
+          checker_obj.targets[target_found.ip] = checker_obj.targets[target_found.ip] or {}
+          checker_obj.targets[target_found.ip][target_found.port] =
+            checker_obj.targets[target_found.ip][target_found.port] or {}
+          checker_obj.targets[target_found.ip][target_found.port][target_found.hostname] =
+            target_found
+          checker_obj.targets[#checker_obj.targets + 1] = target_found
+          checker_obj:log(WARN, "reconciled missing target from shm (never seen locally) '",
+                          target_found.hostname or "", "(", target_found.ip, ":",
+                          target_found.port, ")' as '", shm_health, "'")
+        elseif shm_health ~= target_found.internal_health then
+          local from = target_found.internal_health == "healthy" or
+                       target_found.internal_health == "mostly_healthy"
+          local to = shm_health == "healthy" or shm_health == "mostly_healthy"
+          if from ~= to then
+            checker_obj.status_ver = checker_obj.status_ver + 1
+          end
+          checker_obj:log(WARN, "reconciled target status from shm (missed event) '",
+                          target_found.hostname or "", "(", target_found.ip, ":",
+                          target_found.port, ")' from '", target_found.internal_health,
+                          "' to '", shm_health, "'")
+        end
+        target_found.internal_health = shm_health
+      end
+    end
+  end
+end
+
+
 ------------------------------------------------------------------------------
 -- Initializing.
 -- @section initializing
@@ -1749,6 +1839,19 @@ function _M.new(opts)
 
         local cur_time = ngx_now()
 
+        -- Self-heal from a missed worker_events broadcast (apache/apisix#13888).
+        -- Unlike the probing/cleanup elections below, this runs on EVERY worker
+        -- EVERY tick it's due, regardless of who owns the periodic/cleanup
+        -- locks -- a worker with no active checker of its own can still be
+        -- routing traffic off a stale cached status for a checker it merely
+        -- reads (get_target_status), so it must reconcile too.
+        if cur_time - last_reconcile_time >= RECONCILE_INTERVAL then
+          last_reconcile_time = cur_time
+          for _, checker_obj in pairs(hcs) do
+            reconcile_target_health(checker_obj)
+          end
+        end
+
         -- Stale-target cleanup is decoupled from active probing and the
         -- periodic lock. A passive-only deployment (checks.passive but no
         -- active interval) has no active checker on any worker, yet still marks
@@ -1932,6 +2035,14 @@ if TESTING then
   -- default CLEANUP_INTERVAL (CHECK_INTERVAL * 25).
   function _M._set_cleanup_interval(interval)
     CLEANUP_INTERVAL = interval
+  end
+
+  -- test-only hook: shorten the shm-vs-local-cache reconciliation cadence so
+  -- the self-heal path (apache/apisix#13888) can be exercised deterministically
+  -- without waiting for the default RECONCILE_INTERVAL.
+  function _M._set_reconcile_interval(interval)
+    RECONCILE_INTERVAL = interval
+    last_reconcile_time = 0
   end
 end
 
