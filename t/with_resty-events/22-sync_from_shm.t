@@ -12,6 +12,25 @@ our $HttpConfig = qq{
     lua_package_path "$pwd/lib/?.lua;;";
     lua_shared_dict test_shm 8m;
 
+    init_by_lua_block {
+        -- poll get_target_status() until it returns `want`, fail past the deadline
+        function wait_status(checker, ip, port, want, timeout)
+            local deadline = ngx.now() + (timeout or 3)
+            while true do
+                local ok = checker:get_target_status(ip, port)
+                if ok == want then
+                    return
+                end
+                ngx.update_time()
+                if ngx.now() >= deadline then
+                    error("target " .. ip .. ":" .. port .. " did not become " ..
+                          tostring(want) .. " within " .. (timeout or 3) .. "s")
+                end
+                ngx.sleep(0.05)
+            end
+        end
+    }
+
     init_worker_by_lua_block {
         local we = require "resty.events.compat"
         assert(we.configure({
@@ -56,8 +75,8 @@ __DATA__
                     }
                 }
             })
-            local ok, err = checker:add_target("127.0.0.1", 2113, nil, true)
-            ngx.sleep(0.2) -- let the add event land
+            assert(checker:add_target("127.0.0.1", 2113, nil, true))
+            wait_status(checker, "127.0.0.1", 2113, true)
             local ver_before = checker.status_ver
             ngx.say(checker:get_target_status("127.0.0.1", 2113))
 
@@ -65,7 +84,7 @@ __DATA__
             local key = checker.TARGET_STATE .. ":127.0.0.1:2113:127.0.0.1"
             assert(checker.shm:set(key, 2)) -- 2 = unhealthy
 
-            ngx.sleep(1.5)
+            wait_status(checker, "127.0.0.1", 2113, false)
             ngx.say(checker:get_target_status("127.0.0.1", 2113))
             ngx.say(checker.status_ver - ver_before)
         }
@@ -99,7 +118,6 @@ false
                     }
                 }
             })
-            ngx.sleep(0.2)
             local ok, err = checker:get_target_status("127.0.0.1", 2114)
             ngx.say(tostring(ok), " ", tostring(err))
 
@@ -110,7 +128,7 @@ false
                 { ip = "127.0.0.1", port = 2114, hostname = "127.0.0.1" },
             })))
 
-            ngx.sleep(1.5)
+            wait_status(checker, "127.0.0.1", 2114, false)
             ok, err = checker:get_target_status("127.0.0.1", 2114)
             ngx.say(tostring(ok), " ", tostring(err))
         }
@@ -143,7 +161,7 @@ false nil
                 }
             })
             assert(checker:add_target("127.0.0.1", 2115, nil, true))
-            ngx.sleep(0.2)
+            wait_status(checker, "127.0.0.1", 2115, true)
 
             -- shm says unhealthy, this worker's cache still says healthy
             local key = checker.TARGET_STATE .. ":127.0.0.1:2115:127.0.0.1"
