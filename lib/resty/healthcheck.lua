@@ -144,6 +144,8 @@ local CHECK_JITTER = CHECK_INTERVAL * 0.1
 local LOCK_PERIOD = CHECK_INTERVAL * 15
 -- interval between stale targets cleanup
 local CLEANUP_INTERVAL = CHECK_INTERVAL * 25
+-- interval between local cache reconciliations from shm
+local SYNC_INTERVAL = CHECK_INTERVAL * 10
 
 -- Counters: a 32-bit shm integer can hold up to four 8-bit counters.
 local CTR_SUCCESS = 0x00000001
@@ -236,6 +238,7 @@ local hcs = setmetatable({}, {
 })
 
 local active_check_timer
+local last_sync = 0
 
 -- serialize a table to a string
 local serialize = codec.encode
@@ -509,8 +512,10 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
         end
         target.purge_time = nil
         found = true
-        internal_health = self:get_target_status(ip, port, hostname) and
-                          "healthy" or "unhealthy"
+        -- shm, not the local cache: this worker may have missed the event
+        internal_health = INTERNAL_STATES[self.shm:get(
+                            key_for(self.TARGET_STATE, ip, port, hostname))]
+                          or internal_health
         break
       end
     end
@@ -1383,6 +1388,28 @@ function checker:event_handler(event_name, ip, port, hostname)
 end
 
 
+--- Reconcile this worker's target cache with shm.
+function checker:sync_from_shm()
+  local targets, err = fetch_target_list(self)
+  if not targets then
+    self:log(ERR, "sync_from_shm: ", err)
+    return
+  end
+
+  for _, target in ipairs(targets) do
+    local state_key = key_for(self.TARGET_STATE, target.ip, target.port, target.hostname)
+    local shm_health = INTERNAL_STATES[self.shm:get(state_key)]
+    local local_target = get_target(self, target.ip, target.port, target.hostname)
+    if shm_health and (not local_target or local_target.internal_health ~= shm_health) then
+      self:log(WARN, "target '", target.hostname or "", "(", target.ip, ":", target.port,
+               ")' reconciled from shm: '", local_target and local_target.internal_health,
+               "' -> '", shm_health, "'")
+      self:event_handler(self.events[shm_health], target.ip, target.port, target.hostname)
+    end
+  end
+end
+
+
 ------------------------------------------------------------------------------
 -- Initializing.
 -- @section initializing
@@ -1748,6 +1775,13 @@ function _M.new(opts)
       expire = function()
 
         local cur_time = ngx_now()
+
+        if last_sync + SYNC_INTERVAL <= cur_time then
+          last_sync = cur_time
+          for _, checker_obj in pairs(hcs) do
+            checker_obj:sync_from_shm()
+          end
+        end
 
         -- Stale-target cleanup is decoupled from active probing and the
         -- periodic lock. A passive-only deployment (checks.passive but no
