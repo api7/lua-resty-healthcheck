@@ -240,3 +240,51 @@ GET /t
 before=nil/target not found after=false true
 --- no_error_log eval
 qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 4: a late remove for a target still in the local copy, removed and added again meanwhile, applies its new state
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local we = require "resty.events.compat"
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            assert(checker:add_target("127.0.0.1", 11111, nil, false))
+            local deadline = ngx.now() + 2
+            while checker:get_target_status("127.0.0.1", 11111) ~= false
+                  and ngx.now() < deadline do
+                ngx.sleep(0.01)
+                ngx.update_time()
+            end
+
+            -- another worker removes the target and adds it again as healthy;
+            -- this worker has seen neither event yet, and the remove is
+            -- delivered first. Nothing below yields, so the timer cannot run.
+            we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
+            assert(checker:remove_target("127.0.0.1", 11111, "127.0.0.1"))
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            local before = checker:get_target_status("127.0.0.1", 11111)
+            checker.ev_callback({ ip = "127.0.0.1", port = 11111, hostname = "127.0.0.1" },
+                                checker.events.remove)
+            ngx.say("before=", tostring(before), " after=",
+                    tostring(checker:get_target_status("127.0.0.1", 11111)))
+        }
+    }
+--- request
+GET /t
+--- response_body
+before=false after=true
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/

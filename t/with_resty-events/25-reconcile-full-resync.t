@@ -200,3 +200,46 @@ true bumped=false false
 --- error_log
 failed to bump the target version: no memory
 --- timeout: 6
+
+
+
+=== TEST 4: after its turn, a checker's next full resync is one interval later
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            healthcheck._set_full_resync_interval(0.2)
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            ngx.sleep(0.5)
+
+            -- nothing changes: only the full resyncs run, every 0.2 s, and not
+            -- on every run of the timer (every 0.1 s)
+            local syncs = 0
+            local orig_sync = checker.sync_from_shm
+            checker.sync_from_shm = function(...)
+                syncs = syncs + 1
+                return orig_sync(...)
+            end
+            ngx.sleep(1)
+            ngx.say(syncs >= 1, " ", syncs <= 6)
+        }
+    }
+--- request
+GET /t
+--- response_body
+true true
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+--- timeout: 6

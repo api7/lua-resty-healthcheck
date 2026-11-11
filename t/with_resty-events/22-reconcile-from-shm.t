@@ -337,7 +337,7 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
             })
             assert(checker:add_target("127.0.0.1", 11111, nil, true))
             assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
-            -- let the first ticks (and the first full resync) pass
+            -- let the first ticks pass, so that the timer has recorded the versions
             ngx.sleep(0.3)
 
             local syncs = 0
@@ -705,9 +705,13 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
                 return orig_sync(...)
             end
 
+            -- `a` misses the event, so its copy can only be corrected by the
+            -- timer: that proves the timer ran with the versions moved
+            local we = require "resty.events.compat"
+            we.unregister(a.ev_callback, a.EVENT_SOURCE)
             assert(a:set_target_status("127.0.0.1", 11111, nil, false))
             wait_until(function() return a:get_target_status("127.0.0.1", 11111) == false end)
-            -- give the timer a few ticks to (wrongly) resync `b`
+            -- give the timer a few more ticks to (wrongly) resync `b`
             ngx.sleep(0.3)
             ngx.say(b_syncs, " ", a:get_target_status("127.0.0.1", 11111))
         }
@@ -752,9 +756,13 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
                 return orig_sync(...)
             end
 
+            -- `new` misses the event, so its copy can only be corrected by the
+            -- timer: that proves the timer ran with the versions moved
+            local we = require "resty.events.compat"
+            we.unregister(new.ev_callback, new.EVENT_SOURCE)
             assert(new:set_target_status("127.0.0.1", 11111, nil, false))
             wait_until(function() return new:get_target_status("127.0.0.1", 11111) == false end)
-            -- give the timer a few ticks to (wrongly) resync `old`
+            -- give the timer a few more ticks to (wrongly) resync `old`
             ngx.sleep(0.3)
             ngx.say(old_syncs, " ", new:get_target_status("127.0.0.1", 11111))
         }

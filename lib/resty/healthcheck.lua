@@ -566,6 +566,10 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
 
     ok, err = self.shm:set(self.TARGET_LIST, target_list)
     if not ok then
+      if not found then
+        -- leave no state behind for a target that is not listed
+        self.shm:delete(state_key)
+      end
       return nil, "failed to store target_list in shm: " .. err
     end
 
@@ -766,18 +770,29 @@ local function ctr_get(multictr, idx)
 end
 
 
--- Increment the healthy or unhealthy counter. If the threshold of occurrences
--- is reached, it changes the status of the target in the shm and posts an
--- event.
--- @param self The checker object
--- @param health_report "healthy" for the success counter that drives a target
--- towards the healthy state; "unhealthy" for the failure counter.
--- @param ip Target IP
--- @param port Target port
--- @param hostname Target hostname
--- @param limit the limit after which target status is changed
--- @param ctr_type the counter to increment, see CTR_xxx constants
--- @return True if succeeded, or nil and an error message.
+-- Tells whether a target is in the target list in shm. Every change writes
+-- the list, so a missing list was evicted from a full shm: the target is then
+-- assumed to be listed.
+-- @return `true` or `false`, or `nil + error`.
+local function is_listed(self, ip, port, hostname)
+  local raw, err = self.shm:get(self.TARGET_LIST)
+  if err then
+    return nil, "failed to fetch target_list from shm: " .. err
+  end
+  if raw == nil then
+    return true
+  end
+  for _, target in ipairs(deserialize(raw)) do
+    if target.ip == ip and target.port == port
+       and (target.hostname or target.ip) == hostname
+    then
+      return true
+    end
+  end
+  return false
+end
+
+
 -- Writes the state of an existing target. A target removed meanwhile (by
 -- another worker) gets no state written: a state left behind for a removed
 -- target would let a late event bring it back in other workers' copies.
@@ -795,20 +810,9 @@ local function write_target_state(self, ip, port, hostname, state)
 
   -- no state: the target was removed, or its state key was evicted from a
   -- full shm while it is still listed, and then it is written again
-  local raw, get_err = self.shm:get(self.TARGET_LIST)
-  if get_err then
-    return nil, "failed to fetch target_list from shm: " .. get_err
-  end
-  local listed = raw == nil  -- the list itself was evicted: assume listed
-  if raw then
-    for _, target in ipairs(deserialize(raw)) do
-      if target.ip == ip and target.port == port
-         and (target.hostname or target.ip) == hostname
-      then
-        listed = true
-        break
-      end
-    end
+  local listed, list_err = is_listed(self, ip, port, hostname)
+  if listed == nil then
+    return nil, list_err
   end
   if not listed then
     return false
@@ -822,6 +826,18 @@ local function write_target_state(self, ip, port, hostname, state)
 end
 
 
+-- Increment the healthy or unhealthy counter. If the threshold of occurrences
+-- is reached, it changes the status of the target in the shm and posts an
+-- event.
+-- @param self The checker object
+-- @param health_report "healthy" for the success counter that drives a target
+-- towards the healthy state; "unhealthy" for the failure counter.
+-- @param ip Target IP
+-- @param port Target port
+-- @param hostname Target hostname
+-- @param limit the limit after which target status is changed
+-- @param ctr_type the counter to increment, see CTR_xxx constants
+-- @return True if succeeded, or nil and an error message.
 local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_type)
 
   -- fail fast on counters that are disabled by configuration
@@ -1070,10 +1086,12 @@ function checker:set_target_status(ip, port, hostname, is_healthy)
   end
 
   local counter_key = key_for(self.TARGET_COUNTER, ip, port, hostname)
+  local written
 
   local ok, err = locking_target(self, ip, port, hostname, function()
 
-    local written, write_err = write_target_state(self, ip, port, hostname, health_report)
+    local write_err
+    written, write_err = write_target_state(self, ip, port, hostname, health_report)
     if written == nil then
       return nil, write_err
     end
@@ -1082,18 +1100,19 @@ function checker:set_target_status(ip, port, hostname, is_healthy)
       return true
     end
 
+    -- the state is changed: announce it before anything else can fail
+    self:raise_event(self.events[health_report], ip, port, hostname)
+
     local _, err = self.shm:set(counter_key, 0)
     if err then
       return nil, err
     end
 
-    self:raise_event(self.events[health_report], ip, port, hostname)
-
     return true
 
   end)
 
-  if ok then
+  if written then
     self:log(WARN, health_report, " forced for ", hostname, " ", ip, ":", port)
   end
   return ok, err
@@ -1461,7 +1480,8 @@ function checker:event_handler(event_name, ip, port, hostname)
     target_found.internal_health = event_name
 
   elseif event_name == self.events.clear then
-    -- clear local cache
+    -- clear local cache. The event callback resyncs from shm on `clear`
+    -- instead, so this branch is only reached by direct callers.
     self.targets = {}
     self.status_ver = self.status_ver + 1
     self:log(DEBUG, "event: local cache cleared")
@@ -2004,13 +2024,30 @@ function _M.new(opts)
       local hostname = data.hostname or ip
       local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
       local state = INTERNAL_STATES[self.shm:get(state_key)]
-      if state then
+      local known = get_target(self, ip, port, hostname) ~= nil
+      if known and state then
         -- also for a remove: the target is back in shm, so that remove is
         -- stale and the current state applies
         self:event_handler(EVENTS[state], ip, port, hostname)
+        return
+      end
+      if not known and not state then
+        return
+      end
 
-      elseif get_target(self, ip, port, hostname) then
-        -- no longer in shm, whatever the event says
+      -- the target comes or goes: the target list decides, not the state
+      -- key alone (a state can be left behind for a removed target, and a
+      -- state key can be evicted for a listed one)
+      local listed, err = is_listed(self, ip, port, hostname)
+      if listed == nil then
+        -- left to the reconcile timer
+        self.resync_pending = true
+        self:log(ERR, "failed to reconcile targets with shm: ", err)
+        return
+      end
+      if state and listed then
+        self:event_handler(EVENTS[state], ip, port, hostname)
+      elseif known and not listed then
         self:event_handler(EVENTS.remove, ip, port, hostname)
       end
     end

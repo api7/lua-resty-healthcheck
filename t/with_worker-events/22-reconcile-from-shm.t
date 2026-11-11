@@ -190,3 +190,44 @@ GET /t
 false true
 --- no_error_log
 [error]
+
+
+
+=== TEST 5: a remove delivered after the reconciliation removed the target does not log a warning
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local we = require "resty.worker.events"
+            assert(we.configure{ shm = "my_worker_events", interval = 0.1 })
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
+
+            we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
+            assert(checker:remove_target("127.0.0.1", 11111, "127.0.0.1"))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) == nil end))
+
+            -- the remove event is delivered after the timer removed the target
+            checker.ev_callback({ ip = "127.0.0.1", port = 11111, hostname = "127.0.0.1" },
+                                checker.events.remove)
+            local ok, err = checker:get_target_status("127.0.0.1", 11111)
+            ngx.say(tostring(ok), " ", tostring(err))
+        }
+    }
+--- request
+GET /t
+--- response_body
+nil target not found
+--- no_error_log
+trying to remove an unknown target

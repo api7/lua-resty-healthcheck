@@ -240,3 +240,263 @@ GET /t
 state=true announced=true
 --- no_error_log eval
 qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 5: a late event for a removed target whose state was left behind does not bring it back
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            local state_key = checker.TARGET_STATE .. ":127.0.0.1:11111:127.0.0.1"
+            local target = { ip = "127.0.0.1", port = 11111, hostname = "127.0.0.1" }
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
+            assert(checker:remove_target("127.0.0.1", 11111, "127.0.0.1"))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) == nil end))
+
+            -- a state left behind for the removed target (written, e.g., by a
+            -- worker that still runs the previous version of this module
+            -- during a reload), and an event for it delivered late
+            assert(ngx.shared.test_shm:set(state_key, 2))
+            checker.ev_callback(target, checker.events.unhealthy)
+            local ok, err = checker:get_target_status("127.0.0.1", 11111)
+            ngx.say(tostring(ok), " ", tostring(err))
+        }
+    }
+--- request
+GET /t
+--- response_body
+nil target not found
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 6: a late event for a listed target whose state key alone was evicted keeps it
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            local state_key = checker.TARGET_STATE .. ":127.0.0.1:11111:127.0.0.1"
+            local target = { ip = "127.0.0.1", port = 11111, hostname = "127.0.0.1" }
+            assert(checker:add_target("127.0.0.1", 11111, nil, false))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) == false end))
+
+            -- the state key is evicted from a full shm, the target stays
+            -- listed, and an event for it is delivered late
+            ngx.shared.test_shm:delete(state_key)
+            checker.ev_callback(target, checker.events.unhealthy)
+            local ok, err = checker:get_target_status("127.0.0.1", 11111)
+            ngx.say(tostring(ok), " ", tostring(err))
+        }
+    }
+--- request
+GET /t
+--- response_body
+false nil
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 7: set_target_status() announces the state change even if resetting the counter fails
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            local state_key = checker.TARGET_STATE .. ":127.0.0.1:11111:127.0.0.1"
+            local target = { ip = "127.0.0.1", port = 11111, hostname = "127.0.0.1" }
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
+
+            -- the counter key has to be created, and the shm is full
+            local real = checker.shm
+            local counter_key = checker.TARGET_COUNTER .. ":127.0.0.1:11111:127.0.0.1"
+            checker.shm = setmetatable({
+                set = function(_, key, ...)
+                    if key == counter_key then
+                        return nil, "no memory"
+                    end
+                    return real:set(key, ...)
+                end,
+            }, {
+                __index = function(_, name)
+                    local method = real[name]
+                    return function(_, ...)
+                        return method(real, ...)
+                    end
+                end,
+            })
+            local version = real:get(checker.TARGET_VERSION)
+            local ok, err = checker:set_target_status("127.0.0.1", 11111, nil, false)
+            checker.shm = real
+
+            ngx.say(tostring(ok), " ", tostring(err), " state=", real:get(state_key),
+                    " announced=", tostring(real:get(checker.TARGET_VERSION) ~= version))
+        }
+    }
+--- request
+GET /t
+--- response_body
+nil no memory state=2 announced=true
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 8: a state change writes the state key of a listed target again after it was evicted
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            local shm = ngx.shared.test_shm
+            local state_key = checker.TARGET_STATE .. ":127.0.0.1:11111:127.0.0.1"
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
+
+            shm:delete(state_key)
+            assert(checker:set_target_status("127.0.0.1", 11111, nil, false))
+            ngx.say("state=", tostring(shm:get(state_key)))
+        }
+    }
+--- request
+GET /t
+--- response_body
+state=2
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 9: a state change writes the state key again when the target list was evicted too
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            local shm = ngx.shared.test_shm
+            local state_key = checker.TARGET_STATE .. ":127.0.0.1:11111:127.0.0.1"
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
+
+            shm:delete(state_key)
+            shm:delete(checker.TARGET_LIST)
+            assert(checker:set_target_status("127.0.0.1", 11111, nil, false))
+            ngx.say("state=", tostring(shm:get(state_key)))
+        }
+    }
+--- request
+GET /t
+--- response_body
+state=2
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 10: a new target whose list write fails leaves no state behind
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            local shm = ngx.shared.test_shm
+            local state_key = checker.TARGET_STATE .. ":127.0.0.1:11111:127.0.0.1"
+            local real = checker.shm
+            checker.shm = setmetatable({
+                set = function(_, key, ...)
+                    if key == checker.TARGET_LIST then
+                        return nil, "no memory"
+                    end
+                    return real:set(key, ...)
+                end,
+            }, {
+                __index = function(_, name)
+                    local method = real[name]
+                    return function(_, ...)
+                        return method(real, ...)
+                    end
+                end,
+            })
+            local ok, err = checker:add_target("127.0.0.1", 11111, nil, true)
+            checker.shm = real
+            ngx.say(tostring(ok), " ", tostring(err), " state=", tostring(shm:get(state_key)))
+        }
+    }
+--- request
+GET /t
+--- response_body
+nil failed to store target_list in shm: no memory state=nil
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
