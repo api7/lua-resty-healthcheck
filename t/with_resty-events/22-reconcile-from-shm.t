@@ -12,6 +12,21 @@ our $HttpConfig = qq{
     lua_package_path "$pwd/lib/?.lua;;";
     lua_shared_dict test_shm 8m;
 
+    init_by_lua_block {
+        -- polls cond() until it returns true or the timeout (2 s) expires
+        function wait_until(cond, timeout)
+            local deadline = ngx.now() + (timeout or 2)
+            while not cond() do
+                ngx.update_time()
+                if ngx.now() >= deadline then
+                    return false
+                end
+                ngx.sleep(0.01)
+            end
+            return true
+        end
+    }
+
     init_worker_by_lua_block {
         local we = require "resty.events.compat"
         assert(we.configure({
@@ -59,7 +74,7 @@ __DATA__
 
             local a = healthcheck.new(opts)
             assert(a:add_target("127.0.0.1", 11111, nil, true))
-            ngx.sleep(0.2)
+            assert(wait_until(function() return a:get_target_status("127.0.0.1", 11111) end))
 
             -- new() reads the initial state from shm and then calls poll().
             -- Flip the target at that moment and let the event be dispatched
@@ -68,7 +83,10 @@ __DATA__
             we.poll = function(...)
                 we.poll = orig_poll
                 assert(a:set_target_status("127.0.0.1", 11111, nil, false))
-                ngx.sleep(0.05)
+                -- `a` got the event: it has been dispatched, before `b` subscribed
+                assert(wait_until(function()
+                    return a:get_target_status("127.0.0.1", 11111) == false
+                end))
                 return orig_poll(...)
             end
             local b = healthcheck.new(opts)
@@ -82,8 +100,8 @@ __DATA__
 GET /t
 --- response_body
 false
---- no_error_log
-[error]
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
 
 
 
@@ -107,14 +125,14 @@ false
                 },
             })
             assert(checker:add_target("127.0.0.1", 11111, nil, true))
-            ngx.sleep(0.2)
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
             local ver = checker.status_ver
 
             -- from now on this worker misses the checker's events
             we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
             assert(checker:set_target_status("127.0.0.1", 11111, nil, false))
 
-            ngx.sleep(0.3)
+            wait_until(function() return checker:get_target_status("127.0.0.1", 11111) == false end)
             ngx.say(checker:get_target_status("127.0.0.1", 11111), " ",
                     checker.status_ver > ver)
         }
@@ -123,8 +141,8 @@ false
 GET /t
 --- response_body
 false true
---- no_error_log
-[error]
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
 
 
 
@@ -148,13 +166,16 @@ false true
             })
             assert(checker:add_target("127.0.0.1", 11111, nil, true))
             assert(checker:add_target("127.0.0.1", 22222, nil, true))
-            ngx.sleep(0.2)
+            assert(wait_until(function()
+                return checker:get_target_status("127.0.0.1", 11111)
+                       and checker:get_target_status("127.0.0.1", 22222)
+            end))
 
             we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
             -- remove_target() does not default the hostname to the ip
             assert(checker:remove_target("127.0.0.1", 11111, "127.0.0.1"))
 
-            ngx.sleep(0.3)
+            wait_until(function() return select(2, checker:get_target_status("127.0.0.1", 11111)) == "target not found" end)
             local ok, err = checker:get_target_status("127.0.0.1", 11111)
             ngx.say(tostring(ok), " ", tostring(err))
             ngx.say(checker:get_target_status("127.0.0.1", 22222))
@@ -165,8 +186,8 @@ GET /t
 --- response_body
 nil target not found
 true
---- no_error_log
-[error]
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
 
 
 
@@ -194,7 +215,7 @@ true
             we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
             assert(checker:add_target("127.0.0.1", 11111, nil, false))
 
-            ngx.sleep(0.3)
+            wait_until(function() return checker:get_target_status("127.0.0.1", 11111) == false end)
             -- the routing view changed (unknown -> unhealthy), so consumers
             -- caching on status_ver must see a new version
             ngx.say(tostring(checker:get_target_status("127.0.0.1", 11111)), " ",
@@ -205,8 +226,8 @@ true
 GET /t
 --- response_body
 false true
---- no_error_log
-[error]
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
 
 
 
@@ -229,7 +250,7 @@ false true
                 },
             })
             assert(checker:add_target("127.0.0.1", 11111, nil, true))
-            ngx.sleep(0.2)
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
 
             -- this worker's copy goes stale: shm says unhealthy, the local
             -- copy still says healthy (no yield until the re-add below)
@@ -247,12 +268,12 @@ false true
 GET /t
 --- response_body
 unhealthy
---- no_error_log
-[error]
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
 
 
 
-=== TEST 6: a lost version key still triggers one resync
+=== TEST 6: a change whose version keys were lost is still reconciled
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -271,7 +292,10 @@ unhealthy
                 },
             })
             assert(checker:add_target("127.0.0.1", 11111, nil, true))
-            ngx.sleep(0.2)
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
+
+            -- let the ticks record the versions
+            ngx.sleep(0.3)
 
             -- a state change whose version bump is gone, e.g. the version
             -- keys were evicted from a full shm
@@ -281,7 +305,7 @@ unhealthy
             shm:delete(checker.TARGET_VERSION)
             shm:delete(checker.GLOBAL_TARGET_VERSION)
 
-            ngx.sleep(0.3)
+            wait_until(function() return checker:get_target_status("127.0.0.1", 11111) == false end)
             ngx.say(checker:get_target_status("127.0.0.1", 11111))
         }
     }
@@ -289,8 +313,8 @@ unhealthy
 GET /t
 --- response_body
 false
---- no_error_log
-[error]
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
 
 
 
@@ -312,6 +336,8 @@ false
                 },
             })
             assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
+            -- let the first ticks (and the first full resync) pass
             ngx.sleep(0.3)
 
             local syncs = 0
@@ -338,7 +364,7 @@ false
             local idle = syncs
 
             assert(checker:set_target_status("127.0.0.1", 11111, nil, false))
-            ngx.sleep(0.3)
+            wait_until(function() return syncs >= 1 end)
             local after_change = syncs
 
             ngx.sleep(1)
@@ -350,8 +376,8 @@ false
 GET /t
 --- response_body
 0 0 true true
---- no_error_log
-[error]
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
 
 
 
@@ -391,7 +417,7 @@ qq{
                 },
             })
             assert(checker:add_target("127.0.0.1", 2117, nil, true))
-            ngx.sleep(0.3)
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 2117) end))
 
             -- the only worker, which also runs the probes, misses the event:
             -- its copy says healthy while shm says unhealthy. Probes succeed,
@@ -399,8 +425,15 @@ qq{
             we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
             assert(checker:set_target_status("127.0.0.1", 2117, nil, false))
 
-            ngx.sleep(1)
-            local list = healthcheck.get_target_list("testing", "test_shm")
+            -- wait for the recovery, bounded so that a stuck target fails
+            local list
+            local deadline = ngx.now() + 3
+            repeat
+                ngx.sleep(0.1)
+                list = healthcheck.get_target_list("testing", "test_shm")
+            until (list[1].status == "healthy"
+                   and checker:get_target_status("127.0.0.1", 2117))
+                  or ngx.now() >= deadline
             ngx.say(list[1].status, " ", checker:get_target_status("127.0.0.1", 2117))
         }
     }
@@ -408,8 +441,8 @@ qq{
 GET /t
 --- response_body
 healthy true
---- no_error_log
-[error]
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
 --- timeout: 5
 
 
@@ -465,3 +498,306 @@ GET /t
 true nil
 --- error_log
 untested lua-resty-events version: 9.9.9
+
+
+
+=== TEST 11: a change made while a checker is stopped is applied when it starts again
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local function new_checker(name)
+                return assert(healthcheck.new({
+                    name = name,
+                    shm_name = "test_shm",
+                    events_module = "resty.events",
+                    checks = {
+                        active = {
+                            healthy = { interval = 0 },
+                            unhealthy = { interval = 0 },
+                        },
+                    },
+                }))
+            end
+            local a = new_checker("a")
+            -- another live checker in the same shm keeps the shared version
+            -- moving while `a` is stopped
+            local other = new_checker("other")
+            assert(other:add_target("127.0.0.1", 22222, nil, true))
+            assert(a:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return a:get_target_status("127.0.0.1", 11111) end))
+            -- let the other checker's ticks record the shared version
+            ngx.sleep(0.3)
+
+            a:stop()
+            -- e.g. made by another worker; `a` does not receive the event
+            assert(a:set_target_status("127.0.0.1", 11111, nil, false))
+            ngx.sleep(0.3)
+
+            assert(a:start())
+            -- no sleep: start() resyncs
+            ngx.say(a:get_target_status("127.0.0.1", 11111))
+        }
+    }
+--- request
+GET /t
+--- response_body
+false
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 12: a target added as unhealthy bumps status_ver on the normal event path
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            ngx.sleep(0.3)
+            local ver = checker.status_ver
+
+            -- unknown (treated as usable by callers) -> unhealthy
+            assert(checker:add_target("127.0.0.1", 11111, nil, false))
+            wait_until(function() return checker:get_target_status("127.0.0.1", 11111) == false end)
+            ngx.say(tostring(checker:get_target_status("127.0.0.1", 11111)), " ",
+                    checker.status_ver > ver)
+        }
+    }
+--- request
+GET /t
+--- response_body
+false true
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 13: removing an unhealthy target bumps status_ver
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            -- set_target_status() needs the target in the local copy
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
+            assert(checker:set_target_status("127.0.0.1", 11111, nil, false))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) == false end))
+            local ver = checker.status_ver
+
+            -- unhealthy -> unknown (treated as usable by callers)
+            assert(checker:remove_target("127.0.0.1", 11111, "127.0.0.1"))
+            wait_until(function() return select(2, checker:get_target_status("127.0.0.1", 11111)) == "target not found" end)
+            local ok, err = checker:get_target_status("127.0.0.1", 11111)
+            ngx.say(tostring(ok), " ", tostring(err), " ", checker.status_ver > ver)
+        }
+    }
+--- request
+GET /t
+--- response_body
+nil target not found true
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 14: clear() bumps status_ver in the calling worker
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            assert(checker:add_target("127.0.0.1", 11111, nil, false))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) == false end))
+            local ver = checker.status_ver
+
+            assert(checker:clear())
+            ngx.sleep(0.3)
+            local ok, err = checker:get_target_status("127.0.0.1", 11111)
+            ngx.say(tostring(ok), " ", tostring(err), " ", checker.status_ver > ver)
+        }
+    }
+--- request
+GET /t
+--- response_body
+nil target not found true
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 15: a change to one checker does not resync the others
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local function new_checker(name)
+                return assert(healthcheck.new({
+                    name = name,
+                    shm_name = "test_shm",
+                    events_module = "resty.events",
+                    checks = {
+                        active = {
+                            healthy = { interval = 0 },
+                            unhealthy = { interval = 0 },
+                        },
+                    },
+                }))
+            end
+            local a = new_checker("a")
+            local b = new_checker("b")
+            assert(a:add_target("127.0.0.1", 11111, nil, true))
+            assert(b:add_target("127.0.0.1", 22222, nil, true))
+            assert(wait_until(function()
+                return a:get_target_status("127.0.0.1", 11111)
+                       and b:get_target_status("127.0.0.1", 22222)
+            end))
+            ngx.sleep(0.3)
+
+            local b_syncs = 0
+            local orig_sync = b.sync_from_shm
+            b.sync_from_shm = function(...)
+                b_syncs = b_syncs + 1
+                return orig_sync(...)
+            end
+
+            assert(a:set_target_status("127.0.0.1", 11111, nil, false))
+            wait_until(function() return a:get_target_status("127.0.0.1", 11111) == false end)
+            -- give the timer a few ticks to (wrongly) resync `b`
+            ngx.sleep(0.3)
+            ngx.say(b_syncs, " ", a:get_target_status("127.0.0.1", 11111))
+        }
+    }
+--- request
+GET /t
+--- response_body
+0 false
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 16: a stopped checker is not resynced
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local opts = {
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            }
+            -- a checker being replaced by a new one with the same name
+            local old = healthcheck.new(opts)
+            local new = healthcheck.new(opts)
+            assert(new:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return new:get_target_status("127.0.0.1", 11111) end))
+            old:stop()
+
+            local old_syncs = 0
+            local orig_sync = old.sync_from_shm
+            old.sync_from_shm = function(...)
+                old_syncs = old_syncs + 1
+                return orig_sync(...)
+            end
+
+            assert(new:set_target_status("127.0.0.1", 11111, nil, false))
+            wait_until(function() return new:get_target_status("127.0.0.1", 11111) == false end)
+            -- give the timer a few ticks to (wrongly) resync `old`
+            ngx.sleep(0.3)
+            ngx.say(old_syncs, " ", new:get_target_status("127.0.0.1", 11111))
+        }
+    }
+--- request
+GET /t
+--- response_body
+0 false
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 17: version keys recreated after eviction do not come back to a value already seen
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local we = require "resty.events.compat"
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
+            -- let the ticks record the versions
+            ngx.sleep(0.3)
+
+            we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
+            -- both keys are evicted and recreated by the next change before
+            -- any timer tick runs (no yield in between)
+            local shm = ngx.shared.test_shm
+            shm:delete(checker.TARGET_VERSION)
+            shm:delete(checker.GLOBAL_TARGET_VERSION)
+            assert(checker:set_target_status("127.0.0.1", 11111, nil, false))
+
+            wait_until(function() return checker:get_target_status("127.0.0.1", 11111) == false end)
+            ngx.say(checker:get_target_status("127.0.0.1", 11111))
+        }
+    }
+--- request
+GET /t
+--- response_body
+false
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/

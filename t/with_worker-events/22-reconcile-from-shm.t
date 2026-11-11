@@ -11,6 +11,21 @@ our $HttpConfig = qq{
     lua_package_path "$pwd/lib/?.lua;;";
     lua_shared_dict test_shm 8m;
     lua_shared_dict my_worker_events 8m;
+
+    init_by_lua_block {
+        -- polls cond() until it returns true or the timeout (2 s) expires
+        function wait_until(cond, timeout)
+            local deadline = ngx.now() + (timeout or 2)
+            while not cond() do
+                ngx.update_time()
+                if ngx.now() >= deadline then
+                    return false
+                end
+                ngx.sleep(0.01)
+            end
+            return true
+        end
+    }
 };
 
 run_tests();
@@ -86,7 +101,7 @@ false
             we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
             assert(checker:set_target_status("127.0.0.1", 11111, nil, false))
 
-            ngx.sleep(0.3)
+            wait_until(function() return checker:get_target_status("127.0.0.1", 11111) == false end)
             ngx.say(checker:get_target_status("127.0.0.1", 11111), " ",
                     checker.status_ver > ver)
         }
@@ -125,7 +140,7 @@ false true
             -- remove_target() does not default the hostname to the ip
             assert(checker:remove_target("127.0.0.1", 11111, "127.0.0.1"))
 
-            ngx.sleep(0.3)
+            wait_until(function() return select(2, checker:get_target_status("127.0.0.1", 11111)) == "target not found" end)
             local ok, err = checker:get_target_status("127.0.0.1", 11111)
             ngx.say(tostring(ok), " ", tostring(err))
             ngx.say(checker:get_target_status("127.0.0.1", 22222))
@@ -164,7 +179,7 @@ true
             we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
             assert(checker:add_target("127.0.0.1", 11111, nil, false))
 
-            ngx.sleep(0.3)
+            wait_until(function() return checker:get_target_status("127.0.0.1", 11111) == false end)
             ngx.say(tostring(checker:get_target_status("127.0.0.1", 11111)), " ",
                     checker.status_ver > ver)
         }

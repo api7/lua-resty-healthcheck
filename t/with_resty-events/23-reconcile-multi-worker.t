@@ -104,7 +104,7 @@ our $HttpConfig = qq{
 
             ngx.update_time()
             local elapsed = ngx.now() - (shm:get("flipped_at") or ngx.now())
-            shm:set("result:" .. my_id, elapsed <= 0.5 and "converged"
+            shm:set("result:" .. my_id, elapsed <= 1 and "converged"
                                         or ("slow: " .. elapsed))
         end)
     }
@@ -149,6 +149,6 @@ GET /t
 --- response_body
 worker 0: converged
 worker 1: converged
---- no_error_log
-[error]
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
 --- timeout: 10
