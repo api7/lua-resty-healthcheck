@@ -113,7 +113,7 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
             if ngx.re.match(events_version, [[^0\.1\.]], "jo") then
                 ngx.log(ngx.WARN, "skipped: lua-resty-events ", events_version,
                         " has no max_queue_len")
-                ngx.say("shm=healthy local=true overflowed=true")
+                ngx.say("shm=healthy local=true overflowed=true delivered=unhealthy@healthy")
                 return
             end
 
@@ -132,6 +132,21 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
             })
             assert(checker:add_target("127.0.0.1", 11111, nil, true))
             ngx.sleep(0.3)
+
+            -- records which events of the target reach the checker, and what
+            -- shm holds at that moment
+            local state_key = checker.TARGET_STATE .. ":127.0.0.1:11111:127.0.0.1"
+            local deliveries = {}
+            local function spy(data, event, ...)
+                if data.port == 11111 then
+                    local state = ngx.shared.test_shm:get(state_key)
+                    deliveries[#deliveries + 1] = event .. "@" .. tostring(state and
+                        ({ "healthy", "unhealthy", "mostly_healthy", "mostly_unhealthy" })[state])
+                end
+                return checker.ev_callback(data, event, ...)
+            end
+            we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
+            we.register(spy, checker.EVENT_SOURCE)
 
             -- a slow subscriber to another source keeps this worker's queue busy
             local fast_delivered = 0
@@ -155,13 +170,15 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
             ngx.say("shm=", list[1].status,
                     " local=", tostring(checker:get_target_status("127.0.0.1", 11111)),
                     -- some events were dropped: the scenario did happen
-                    " overflowed=", tostring(fast_delivered < 6))
+                    " overflowed=", tostring(fast_delivered < 6),
+                    -- only E1 reached the checker, after E2's change was in shm
+                    " delivered=", table.concat(deliveries, ","))
         }
     }
 --- request
 GET /t
 --- response_body
-shm=healthy local=true overflowed=true
+shm=healthy local=true overflowed=true delivered=unhealthy@healthy
 --- no_error_log
 failed to reconcile
 --- timeout: 8

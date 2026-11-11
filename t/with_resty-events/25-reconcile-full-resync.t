@@ -132,3 +132,71 @@ GET /t
 --- no_error_log eval
 qr/\[error\](?!.*lua tcp socket read timed out)/
 --- timeout: 6
+
+
+
+=== TEST 3: a change whose version bumps failed is still picked up by the full resync
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local we = require "resty.events.compat"
+            local healthcheck = require("resty.healthcheck")
+            healthcheck._set_full_resync_interval(0.5)
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            local deadline = ngx.now() + 2
+            while not checker:get_target_status("127.0.0.1", 11111) and ngx.now() < deadline do
+                ngx.sleep(0.01)
+                ngx.update_time()
+            end
+            ngx.sleep(0.3)
+
+            -- both version bumps of the next change fail (as when the keys
+            -- must be created in a full shm), and this worker misses its event
+            local real = checker.shm
+            checker.shm = setmetatable({
+                incr = function()
+                    return nil, "no memory"
+                end,
+            }, {
+                __index = function(_, name)
+                    local method = real[name]
+                    return function(_, ...)
+                        return method(real, ...)
+                    end
+                end,
+            })
+            we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
+            local version = real:get(checker.TARGET_VERSION)
+            local ok = checker:set_target_status("127.0.0.1", 11111, nil, false)
+            checker.shm = real
+            local bumped = real:get(checker.TARGET_VERSION) ~= version
+
+            deadline = ngx.now() + 3
+            repeat
+                ngx.sleep(0.05)
+                ngx.update_time()
+            until checker:get_target_status("127.0.0.1", 11111) == false
+                  or ngx.now() >= deadline
+            ngx.say(tostring(ok), " bumped=", tostring(bumped), " ",
+                    tostring(checker:get_target_status("127.0.0.1", 11111)))
+        }
+    }
+--- request
+GET /t
+--- response_body
+true bumped=false false
+--- error_log
+failed to bump the target version: no memory
+--- timeout: 6
