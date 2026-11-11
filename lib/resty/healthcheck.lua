@@ -26,6 +26,7 @@
 
 local ERR = ngx.ERR
 local WARN = ngx.WARN
+local INFO = ngx.INFO
 local DEBUG = ngx.DEBUG
 local ngx_log = ngx.log
 local tostring = tostring
@@ -38,6 +39,7 @@ local resty_timer = require "resty.timer"
 local bit = require("bit")
 local re_find = ngx.re.find
 local ngx_now = ngx.now
+local math_floor = math.floor
 local ngx_worker_id = ngx.worker.id
 local ngx_worker_pid = ngx.worker.pid
 local pcall = pcall
@@ -46,7 +48,12 @@ local type = type
 local assert = assert
 
 
-local RESTY_EVENTS_VER = [[^0\.1\.\d+$]]
+-- The lua-resty-events compat layer reports "0.1.x" up to lua-resty-events
+-- 0.2.x, and the library version itself from 0.3.0 on. All of these keep the
+-- API used here; other versions are loaded with a warning instead of failing,
+-- since refusing to load would disable health checking altogether.
+local RESTY_EVENTS_VER = [[^0\.[1-3]\.\d+$]]
+local resty_events_version_warned = false
 local RESTY_WORKER_EVENTS_VER = "0.3.3"
 
 
@@ -111,8 +118,13 @@ local function load_events_module(self)
 
   elseif self.events_module == "resty.events" then
     worker_events = require("resty.events.compat")
-    local version_match = ngx.re.match(worker_events._VERSION, RESTY_EVENTS_VER, "o")
-    assert(version_match, "unsupported lua-resty-events version")
+    local version = tostring(worker_events._VERSION)
+    if not resty_events_version_warned
+       and not ngx.re.match(version, RESTY_EVENTS_VER, "jo")
+    then
+      resty_events_version_warned = true
+      ngx_log(WARN, "[healthcheck] untested lua-resty-events version: ", version)
+    end
 
   else
     error("unknown events module")
@@ -509,8 +521,10 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
         end
         target.purge_time = nil
         found = true
-        internal_health = self:get_target_status(ip, port, hostname) and
-                          "healthy" or "unhealthy"
+        -- keep the state shared in shm: this worker's local copy may be
+        -- stale if it missed an event, and would overwrite the shm state
+        local state = self.shm:get(key_for(self.TARGET_STATE, ip, port, hostname))
+        internal_health = INTERNAL_STATES[state] or internal_health
         break
       end
     end
@@ -1383,6 +1397,118 @@ function checker:event_handler(event_name, ip, port, hostname)
 end
 
 
+local function target_key(ip, port, hostname)
+  return ip .. ":" .. tostring(port) .. ":" .. (hostname or ip)
+end
+
+
+--- Reconcile this worker's copy of the targets with shm.
+-- The copy is normally kept up to date by events. When an event is missed
+-- (raised before this checker subscribed, or lost in transport), the copy
+-- stays wrong until the next change of the same target. This repairs it:
+-- targets missing locally are added, targets no longer listed in shm are
+-- removed, and statuses are taken from shm. `status_ver` is bumped whenever
+-- the routing view changes.
+-- It is called by `new()` right after subscribing, and by the periodic timer
+-- of every worker whenever the target version in shm has changed.
+-- @return the number of corrected targets, or `nil + error`.
+function checker:sync_from_shm()
+  local target_list, err = fetch_target_list(self)
+  if not target_list then
+    return nil, err
+  end
+
+  local corrected = 0
+  local listed = {}
+
+  for _, target in ipairs(target_list) do
+    local ip, port, hostname = target.ip, target.port, target.hostname or target.ip
+    listed[target_key(ip, port, hostname)] = true
+
+    local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
+    local state = INTERNAL_STATES[self.shm:get(state_key)]
+    -- no state yet: the target is being added or removed right now, and the
+    -- event (or the next version bump) will settle it
+    if state then
+      local local_target = get_target(self, ip, port, hostname)
+      if not local_target or local_target.internal_health ~= state then
+        local status_ver = self.status_ver
+        self:event_handler(self.events[state], ip, port, hostname)
+
+        -- callers treat a target they don't know as usable, so learning that
+        -- it is unhealthy changes the routing view too, although
+        -- event_handler() only bumps on a healthy <-> unhealthy change
+        if not local_target and self.status_ver == status_ver then
+          self.status_ver = self.status_ver + 1
+        end
+
+        corrected = corrected + 1
+      end
+    end
+  end
+
+  local stale = {}
+  for _, target in ipairs(self.targets) do
+    if not listed[target_key(target.ip, target.port, target.hostname)] then
+      stale[#stale + 1] = target
+    end
+  end
+
+  for _, target in ipairs(stale) do
+    self:event_handler(self.events.remove, target.ip, target.port, target.hostname)
+    corrected = corrected + 1
+  end
+
+  if corrected > 0 then
+    -- also expected when the timer runs between a change and its event
+    self:log(INFO, "reconciled ", corrected, " target(s) with shm")
+  end
+
+  return corrected
+end
+
+
+-- Global target version last seen by this worker, per shm name.
+local global_versions_seen = {}
+
+-- Called by the periodic timer of every worker. When nothing changed, this
+-- costs one shm read per shm: the version shared by all checkers in it. Only
+-- when that version moved are the per-checker versions read, and only the
+-- checkers whose version moved are resynced from shm.
+local function reconcile_checkers()
+  local global_versions = {}
+
+  for _, checker_obj in pairs(hcs) do
+    if not checker_obj.stopped then
+      local shm_name = checker_obj.shm_name
+      local global_version = global_versions[shm_name]
+      if global_version == nil then
+        -- false: no version yet (nothing changed so far, or it was evicted)
+        global_version = checker_obj.shm:get(checker_obj.GLOBAL_TARGET_VERSION) or false
+        global_versions[shm_name] = global_version
+      end
+
+      if global_version ~= global_versions_seen[shm_name] then
+        local version = checker_obj.shm:get(checker_obj.TARGET_VERSION)
+        if version ~= checker_obj.version_seen then
+          checker_obj.version_seen = version
+          local _, err = checker_obj:sync_from_shm()
+          if err then
+            checker_obj:log(ERR, "failed to reconcile targets with shm: ", err)
+          end
+        end
+      end
+    end
+  end
+
+  -- the versions were read before any resync, so a change made meanwhile
+  -- is seen again on the next run
+  for shm_name, global_version in pairs(global_versions) do
+    global_versions_seen[shm_name] = global_version
+  end
+end
+
+
 ------------------------------------------------------------------------------
 -- Initializing.
 -- @section initializing
@@ -1395,8 +1521,30 @@ function checker:log(level, ...)
 end
 
 
--- Raises an event for a target status change.
+-- Bumps this checker's version and the version shared by all checkers in the
+-- shm. Every worker compares them with what it saw last (see
+-- `reconcile_checkers`), so a change is noticed even when its event is missed.
+-- A recreated key (e.g. after eviction) starts from the current time in ms, so
+-- it cannot come back to a value a worker has already seen.
+local function bump_versions(self)
+  local init = math_floor(ngx_now() * 1000)
+  local _, err = self.shm:incr(self.TARGET_VERSION, 1, init)
+  if err then
+    self:log(WARN, "failed to bump the target version: ", err)
+  end
+
+  _, err = self.shm:incr(self.GLOBAL_TARGET_VERSION, 1, init)
+  if err then
+    self:log(WARN, "failed to bump the global target version: ", err)
+  end
+end
+
+
+-- Raises an event for a target change. Callers write the change to shm
+-- first, so the version bump below always announces data that is already
+-- readable.
 function checker:raise_event(event_name, ip, port, hostname)
+  bump_versions(self)
   local target = { ip = ip, port = port, hostname = hostname }
   worker_events.post(self.EVENT_SOURCE, event_name, target)
 end
@@ -1409,6 +1557,7 @@ end
 function checker:stop()
   self.checks.active.healthy.active = false
   self.checks.active.unhealthy.active = false
+  self.stopped = true
   worker_events.unregister(self.ev_callback, self.EVENT_SOURCE)
   self:log(DEBUG, "healthchecker stopped")
   return true
@@ -1429,6 +1578,7 @@ function checker:start()
     self.checks.active.unhealthy.last_run = ngx_now()
   end
 
+  self.stopped = nil
   worker_events.unregister(self.ev_callback, self.EVENT_SOURCE)  -- ensure we never double subscribe
   worker_events.register_weak(self.ev_callback, self.EVENT_SOURCE)
 
@@ -1683,6 +1833,8 @@ function _M.new(opts)
   self.TARGET_LIST      = SHM_PREFIX .. self.name .. ":target_list"
   self.TARGET_LIST_LOCK = SHM_PREFIX .. self.name .. ":target_list_lock"
   self.TARGET_LOCK      = SHM_PREFIX .. self.name .. ":target_lock"
+  self.TARGET_VERSION   = SHM_PREFIX .. self.name .. ":version"
+  self.GLOBAL_TARGET_VERSION = SHM_PREFIX .. ":version"
   self.PERIODIC_LOCK    = SHM_PREFIX .. ":period_lock:"
   -- prepare constants
   self.EVENT_SOURCE     = EVENT_SOURCE_PREFIX .. " [" .. self.name .. "]"
@@ -1731,6 +1883,17 @@ function _M.new(opts)
   if not ok then
     self:stop()
     return nil, err
+  end
+
+  -- Events raised between loading the initial target list above and the
+  -- subscription made by start() are not delivered to this checker (with
+  -- lua-resty-events they are pushed, not replayed), so take another look at
+  -- shm now that we are subscribed. The version is read first: any change made
+  -- after this point bumps it and is picked up by the periodic reconciliation.
+  self.version_seen = self.shm:get(self.TARGET_VERSION)
+  local _, sync_err = self:sync_from_shm()
+  if sync_err then
+    self:log(ERR, "failed to reconcile initial targets with shm: ", sync_err)
   end
 
   -- if active checker is not running, start it
@@ -1801,6 +1964,12 @@ function _M.new(opts)
         elseif add_err ~= "exists" then
           ngx_log(ERR, "failed to elect cleanup worker for '", cleanup_key, "': ", add_err)
         end
+
+        -- Every worker routes from its own copy of the targets, so every
+        -- worker reconciles it, before the early returns below: a worker
+        -- without active checkers, or one that does not hold the periodic
+        -- lock, would otherwise never do it (apache/apisix#13888).
+        reconcile_checkers()
 
         -- The periodic lock distributes ACTIVE probing to a single worker. A
         -- worker with no active checker must release the lock (if it holds it)
