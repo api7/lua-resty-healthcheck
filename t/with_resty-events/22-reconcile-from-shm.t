@@ -105,7 +105,7 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
 
 
 
-=== TEST 2: a missed status event is reconciled from shm within a tick
+=== TEST 2: a missed status event is corrected from shm by the reconcile timer
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -501,11 +501,12 @@ untested lua-resty-events version: 9.9.9
 
 
 
-=== TEST 11: a change made while a checker is stopped is applied when it starts again
+=== TEST 11: a change made while a checker is stopped is applied when it starts again, and later ones keep being reconciled
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
         content_by_lua_block {
+            local we = require "resty.events.compat"
             local healthcheck = require("resty.healthcheck")
             local function new_checker(name)
                 return assert(healthcheck.new({
@@ -538,12 +539,19 @@ untested lua-resty-events version: 9.9.9
             assert(a:start())
             -- no sleep: start() resyncs
             ngx.say(a:get_target_status("127.0.0.1", 11111))
+
+            -- the restarted checker is reconciled by the timer again
+            we.unregister(a.ev_callback, a.EVENT_SOURCE)
+            assert(a:set_target_status("127.0.0.1", 11111, nil, true))
+            wait_until(function() return a:get_target_status("127.0.0.1", 11111) == true end)
+            ngx.say(a:get_target_status("127.0.0.1", 11111))
         }
     }
 --- request
 GET /t
 --- response_body
 false
+true
 --- no_error_log eval
 qr/\[error\](?!.*lua tcp socket read timed out)/
 

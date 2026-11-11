@@ -248,6 +248,7 @@ local hcs = setmetatable({}, {
 })
 
 local active_check_timer
+local reconcile_timer
 
 -- serialize a table to a string
 local serialize = codec.encode
@@ -535,16 +536,20 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
     -- state is filled in.
     local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
     local ok, err
+    local state_filled = false
     if found then
       ok, err = self.shm:add(state_key, INTERNAL_STATES[internal_health])
-      if not ok and err == "exists" then
+      if ok then
+        state_filled = true
+      elseif err == "exists" then
         ok, err = true, nil
       end
     else
       ok, err = self.shm:set(state_key, INTERNAL_STATES[internal_health])
     end
     if not ok then
-      self:log(ERR, "failed to set initial health status in shm: ", err)
+      -- a listed target without a state is never probed: do not publish it
+      return nil, "failed to set initial health status in shm: " .. err
     end
 
     -- target does not exist, go add it
@@ -564,8 +569,8 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
       return nil, "failed to store target_list in shm: " .. err
     end
 
-    -- raise event for our newly added target
-    if not found then
+    -- raise event for our newly added target, or for the state filled in
+    if not found or state_filled then
       self:raise_event(self.events[internal_health], ip, port, hostname)
     end
 
@@ -773,6 +778,50 @@ end
 -- @param limit the limit after which target status is changed
 -- @param ctr_type the counter to increment, see CTR_xxx constants
 -- @return True if succeeded, or nil and an error message.
+-- Writes the state of an existing target. A target removed meanwhile (by
+-- another worker) gets no state written: a state left behind for a removed
+-- target would let a late event bring it back in other workers' copies.
+-- @return `true` when written, `false` when the target was removed, or
+-- `nil + error`.
+local function write_target_state(self, ip, port, hostname, state)
+  local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
+  local ok, err = self.shm:replace(state_key, INTERNAL_STATES[state])
+  if ok then
+    return true
+  end
+  if err ~= "not found" then
+    return nil, err
+  end
+
+  -- no state: the target was removed, or its state key was evicted from a
+  -- full shm while it is still listed, and then it is written again
+  local raw, get_err = self.shm:get(self.TARGET_LIST)
+  if get_err then
+    return nil, "failed to fetch target_list from shm: " .. get_err
+  end
+  local listed = raw == nil  -- the list itself was evicted: assume listed
+  if raw then
+    for _, target in ipairs(deserialize(raw)) do
+      if target.ip == ip and target.port == port
+         and (target.hostname or target.ip) == hostname
+      then
+        listed = true
+        break
+      end
+    end
+  end
+  if not listed then
+    return false
+  end
+
+  ok, err = self.shm:set(state_key, INTERNAL_STATES[state])
+  if not ok then
+    return nil, err
+  end
+  return true
+end
+
+
 local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_type)
 
   -- fail fast on counters that are disabled by configuration
@@ -831,9 +880,13 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
     end
 
     if new_health and new_health ~= current_health then
-      local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
-      self.shm:set(state_key, INTERNAL_STATES[new_health])
-      self:raise_event(self.events[new_health], ip, port, hostname)
+      local written, write_err = write_target_state(self, ip, port, hostname, new_health)
+      if written == nil then
+        return nil, write_err
+      end
+      if written then
+        self:raise_event(self.events[new_health], ip, port, hostname)
+      end
     end
 
     return true
@@ -1017,16 +1070,19 @@ function checker:set_target_status(ip, port, hostname, is_healthy)
   end
 
   local counter_key = key_for(self.TARGET_COUNTER, ip, port, hostname)
-  local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
 
   local ok, err = locking_target(self, ip, port, hostname, function()
 
-    local _, err = self.shm:set(counter_key, 0)
-    if err then
-      return nil, err
+    local written, write_err = write_target_state(self, ip, port, hostname, health_report)
+    if written == nil then
+      return nil, write_err
+    end
+    if not written then
+      -- removed meanwhile by another worker
+      return true
     end
 
-    self.shm:set(state_key, INTERNAL_STATES[health_report])
+    local _, err = self.shm:set(counter_key, 0)
     if err then
       return nil, err
     end
@@ -1427,10 +1483,17 @@ end
 -- timer of every worker.
 -- @return the number of corrected targets, or `nil + error`.
 function checker:sync_from_shm()
-  local target_list, err = fetch_target_list(self)
-  if not target_list then
-    return nil, err
+  local raw, err = self.shm:get(self.TARGET_LIST)
+  if err then
+    return nil, "failed to fetch target_list from shm: " .. err
   end
+  if raw == nil then
+    -- every change writes the list, so a missing list was evicted from a
+    -- full shm (or never written): keep the local copy rather than dropping
+    -- every target
+    return 0
+  end
+  local target_list = deserialize(raw)
 
   local corrected = 0
   local listed = {}
@@ -1480,34 +1543,37 @@ end
 -- Global target version last seen by this worker, per shm name.
 local global_versions_seen = {}
 
--- Every FULL_RESYNC_INTERVAL, all checkers are resynced whatever the versions
--- say. This repairs changes whose version bump was lost (an incr failure, an
--- evicted key) and changes made during an nginx reload by workers that still
--- run an older version of this module, which does not bump versions.
+-- Every FULL_RESYNC_INTERVAL, each checker is also resynced whatever the
+-- versions say. This repairs changes whose version bump was lost (an incr
+-- failure, an evicted key) and changes made during an nginx reload by workers
+-- that still run an older version of this module, which does not bump
+-- versions. The checkers' turns are spread over the interval, so that no
+-- single run resyncs all of them.
 local FULL_RESYNC_INTERVAL = CHECK_INTERVAL * 100
--- checkers are resynced by start() when created, so the first full resync is
--- due one interval after this worker's first run
-local last_full_resync
+local full_resync_seq = 0
 
--- Called by the periodic timer of every worker. When nothing changed, this
--- costs one shm read per shm: the version shared by all checkers in it. Only
--- when that version moved are the per-checker versions read, and only the
--- checkers whose version moved are resynced from shm.
+-- Called by the reconcile timer of every worker. When nothing changed, this
+-- costs one shm read per shm (the version shared by all checkers in it), plus
+-- the full resync of the checkers whose turn it is. Only when the shared
+-- version moved are the per-checker versions read, and only the checkers
+-- whose version moved are resynced from shm.
 local function reconcile_checkers()
   local now = ngx_now()
-  if not last_full_resync then
-    last_full_resync = now
-  end
-  local full = now - last_full_resync >= FULL_RESYNC_INTERVAL
-  if full then
-    last_full_resync = now
-  end
-
   local global_versions = {}
-  local failed = {}
 
   for _, checker_obj in pairs(hcs) do
     if not checker_obj.stopped then
+      local full_at = checker_obj.full_resync_at
+      if not full_at then
+        -- start() just resynced this checker: its first turn comes one to two
+        -- intervals from now, spread over the checkers of this worker
+        full_resync_seq = full_resync_seq + 1
+        full_at = now + FULL_RESYNC_INTERVAL * (1 + (full_resync_seq % 100) / 100)
+        checker_obj.full_resync_at = full_at
+      end
+      local full = now >= full_at
+      local force = full or checker_obj.resync_pending
+
       local shm_name = checker_obj.shm_name
       local global_version = global_versions[shm_name]
       if global_version == nil then
@@ -1516,16 +1582,20 @@ local function reconcile_checkers()
         global_versions[shm_name] = global_version
       end
 
-      if full or global_version ~= global_versions_seen[shm_name] then
+      if force or global_version ~= global_versions_seen[shm_name] then
         local version = checker_obj.shm:get(checker_obj.TARGET_VERSION)
-        if full or version ~= checker_obj.version_seen then
+        if force or version ~= checker_obj.version_seen then
           local _, err = checker_obj:sync_from_shm()
           if err then
-            -- retried on the next run
-            failed[shm_name] = true
+            -- retried on the next run, whatever the versions say
+            checker_obj.resync_pending = true
             checker_obj:log(ERR, "failed to reconcile targets with shm: ", err)
           else
+            checker_obj.resync_pending = nil
             checker_obj.version_seen = version
+            if full then
+              checker_obj.full_resync_at = now + FULL_RESYNC_INTERVAL
+            end
           end
         end
       end
@@ -1535,9 +1605,7 @@ local function reconcile_checkers()
   -- the versions were read before any resync, so a change made meanwhile
   -- is seen again on the next run
   for shm_name, global_version in pairs(global_versions) do
-    if not failed[shm_name] then
-      global_versions_seen[shm_name] = global_version
-    end
+    global_versions_seen[shm_name] = global_version
   end
 end
 
@@ -1623,8 +1691,11 @@ function checker:start()
   local version = self.shm:get(self.TARGET_VERSION)
   local _, err = self:sync_from_shm()
   if err then
+    -- retried by the reconcile timer, whatever the versions say
+    self.resync_pending = true
     self:log(ERR, "failed to reconcile targets with shm: ", err)
   else
+    self.resync_pending = nil
     self.version_seen = version
   end
 
@@ -1934,10 +2005,9 @@ function _M.new(opts)
       local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
       local state = INTERNAL_STATES[self.shm:get(state_key)]
       if state then
-        -- a remove for a target that is back in shm is stale
-        if event ~= EVENTS.remove then
-          self:event_handler(EVENTS[state], ip, port, hostname)
-        end
+        -- also for a remove: the target is back in shm, so that remove is
+        -- stale and the current state applies
+        self:event_handler(EVENTS[state], ip, port, hostname)
 
       elseif get_target(self, ip, port, hostname) then
         -- no longer in shm, whatever the event says
@@ -1956,6 +2026,28 @@ function _M.new(opts)
     return nil, err
   end
 
+  -- Every worker routes from its own copy of the targets, so every worker
+  -- reconciles it (apache/apisix#13888), in a timer of its own: it must not
+  -- wait behind the cleanup's lock waits nor be skipped by the early returns
+  -- of the active-check timer, an error must not stop the probes, and each run
+  -- is a new coroutine, so that no checker stays referenced between runs.
+  if reconcile_timer == nil then
+    local timer_ok, timer_err = ngx.timer.every(CHECK_INTERVAL, function(premature)
+      if premature then
+        return
+      end
+      local ok, err = pcall(reconcile_checkers)
+      if not ok then
+        ngx_log(ERR, LOG_PREFIX, "failed to reconcile targets with shm: ", err)
+      end
+    end)
+    if timer_ok then
+      reconcile_timer = true
+    else
+      self:log(ERR, "could not start the reconcile timer: ", timer_err)
+    end
+  end
+
   -- if active checker is not running, start it
   if active_check_timer == nil then
 
@@ -1969,12 +2061,6 @@ function _M.new(opts)
       jitter = CHECK_JITTER,
       detached = false,
       expire = function()
-
-        -- Every worker routes from its own copy of the targets, so every
-        -- worker reconciles it, first: the cleanup below can wait on locks,
-        -- and a worker without active checkers, or one that does not hold
-        -- the periodic lock, returns early (apache/apisix#13888).
-        reconcile_checkers()
 
         local cur_time = ngx_now()
 
@@ -2015,7 +2101,7 @@ function _M.new(opts)
               if #removed_targets > 0 then
                 target_list = serialize(target_list)
 
-                local ok, err = shm:set(checker_obj.TARGET_LIST, target_list)
+                local ok, err = checker_obj.shm:set(checker_obj.TARGET_LIST, target_list)
                 if not ok then
                   return nil, "failed to store target_list in shm: " .. err
                 end

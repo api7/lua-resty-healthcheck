@@ -77,7 +77,7 @@ false
 
 
 
-=== TEST 2: a missed status event is reconciled from shm within a tick
+=== TEST 2: a missed status event is corrected from shm by the reconcile timer
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
