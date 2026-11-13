@@ -376,8 +376,10 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
 GET /t
 --- response_body
 nil no memory state=2 announced=true
---- no_error_log eval
-qr/\[error\](?!.*lua tcp socket read timed out)/
+--- grep_error_log eval
+qr/unhealthy forced for \S+ [\d.]+:\d+|\[error\](?!.*lua tcp socket read timed out)/
+--- grep_error_log_out
+unhealthy forced for 127.0.0.1 127.0.0.1:11111
 
 
 
@@ -674,5 +676,151 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
 GET /t
 --- response_body
 true state=nil announced=false
---- no_error_log
+--- no_error_log eval
+qr/unhealthy forced for|\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 15: set_target_status() deferred to a timer logs "forced" when the state is written, not before
+--- http_config eval: $::HttpConfig
+--- config
+    location = /locked {
+        content_by_lua_block {
+            -- the target lock is busy for 0.5 s
+            local checker = package.loaded.test_checker
+            local lock = assert(require("resty.lock"):new("test_shm", { exptime = 0.5, timeout = 0 }))
+            assert(lock:lock(checker.TARGET_LOCK .. ":127.0.0.1:11111:127.0.0.1"))
+            ngx.say("locked")
+        }
+        log_by_lua_block {
+            -- not yieldable and the lock is busy: deferred to a timer
+            local checker = package.loaded.test_checker
+            local ok = checker:set_target_status("127.0.0.1", 11111, nil, false)
+            ngx.log(ngx.WARN, "set_target_status returned ", tostring(ok))
+        }
+    }
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            package.loaded.test_checker = checker
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
+
+            local sock = ngx.socket.tcp()
+            assert(sock:connect("127.0.0.1", ngx.var.server_port))
+            assert(sock:send("GET /locked HTTP/1.0\r\nHost: localhost\r\n\r\n"))
+            assert(sock:receive("*a"))
+            sock:close()
+
+            local done = wait_until(function()
+                return checker:get_target_status("127.0.0.1", 11111) == false
+            end, 3)
+            ngx.log(ngx.WARN, "applied: ", tostring(done))
+            ngx.say(tostring(done))
+        }
+    }
+--- request
+GET /t
+--- response_body
+true
+--- grep_error_log eval
+qr/set_target_status returned \w+|unhealthy forced for|applied: \w+/
+--- grep_error_log_out
+set_target_status returned scheduled
 unhealthy forced for
+applied: true
+--- timeout: 6
+
+
+
+=== TEST 16: a status event for a target this worker has, with no state and no longer listed, removes it
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            local target = { ip = "127.0.0.1", port = 11111, hostname = "127.0.0.1" }
+            local we = require "resty.events.compat"
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
+
+            -- another worker removes the target, and an older status event
+            -- reaches this worker before the remove. Nothing below yields.
+            we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
+            assert(checker:remove_target("127.0.0.1", 11111, "127.0.0.1"))
+            local before = checker:get_target_status("127.0.0.1", 11111)
+            checker.ev_callback(target, checker.events.unhealthy)
+            local ok, err = checker:get_target_status("127.0.0.1", 11111)
+            ngx.say("before=", tostring(before), " after=", tostring(ok), " ", tostring(err))
+        }
+    }
+--- request
+GET /t
+--- response_body
+before=true after=nil target not found
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 17: a remove event with both the target list and the state evicted keeps a target this worker has
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            local shm = ngx.shared.test_shm
+            local state_key = checker.TARGET_STATE .. ":127.0.0.1:11111:127.0.0.1"
+            local target = { ip = "127.0.0.1", port = 11111, hostname = "127.0.0.1" }
+            local we = require "resty.events.compat"
+            assert(checker:add_target("127.0.0.1", 11111, nil, false))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) == false end))
+
+            -- Nothing below yields.
+            we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
+            shm:delete(state_key)
+            shm:delete(checker.TARGET_LIST)
+            checker.ev_callback(target, checker.events.remove)
+            local ok, err = checker:get_target_status("127.0.0.1", 11111)
+            ngx.say(tostring(ok), " ", tostring(err))
+        }
+    }
+--- request
+GET /t
+--- response_body
+false nil
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/

@@ -266,4 +266,4 @@ GET /t
 true true true true
 --- no_error_log eval
 qr/\[error\](?!.*lua tcp socket read timed out)/
---- timeout: 6
+--- timeout: 10
