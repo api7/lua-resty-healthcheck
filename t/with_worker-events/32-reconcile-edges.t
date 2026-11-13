@@ -338,3 +338,380 @@ qr/boom-\d/
 boom-1
 boom-3
 boom-4
+
+
+
+=== TEST 4: the event of a change is applied when it comes after a comparison that could not read the state of its target
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local shm = ngx.shared.test_shm
+            local a, b = new_checker(), new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(a:add_target(ip, 22222, nil, true))
+            assert(a:add_target(ip, 33333, nil, true))
+            flush_events()
+            assert(#a.targets == 3 and #b.targets == 3)
+            -- from here on the statuses are compared, not the members
+            lose_events(function()
+                assert(a:set_target_status(ip, 33333, nil, false))
+            end)
+            healthcheck._reconcile()
+            local send = hold_events(function()
+                assert(a:set_target_status(ip, 11111, nil, false))
+            end)
+            -- as evicted from a full shm
+            shm:delete(key_of(a.TARGET_STATE, 11111))
+            local before = stats()
+            healthcheck._reconcile()
+            local kept = status(b, 11111)
+            send()
+            flush_events()
+            ngx.say("members compared=", since(before, "members"), " kept=", kept,
+                    " after the late event=", status(b, 11111),
+                    " version_applied=", tostring(b.version_applied))
+        }
+    }
+--- request
+GET /t
+--- response_body
+members compared=0 kept=true after the late event=false version_applied=nil
+--- no_error_log
+[error]
+
+
+
+=== TEST 5: while shm cannot tell the state of a target, its events are applied in the order of its changes
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local shm = ngx.shared.test_shm
+            local a, b = new_checker(), new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(a:add_target(ip, 22222, nil, true))
+            assert(a:add_target(ip, 33333, nil, true))
+            flush_events()
+            assert(#a.targets == 3 and #b.targets == 3)
+            healthcheck._reconcile()
+            local _, held = hold_events(function()
+                assert(a:set_target_status(ip, 11111, nil, false))
+                assert(a:set_target_status(ip, 11111, nil, true))
+                assert(a:set_target_status(ip, 11111, nil, false))
+            end)
+            -- as evicted from a full shm
+            shm:delete(key_of(a.TARGET_STATE, 11111))
+            healthcheck._reconcile()
+            local kept = status(b, 11111)
+            -- the event of the last change arrives first
+            local we = events()
+            for _, i in ipairs({ 3, 1, 2 }) do
+                we.post(held[i][1], held[i][2], held[i][3])
+                flush_events()
+            end
+            healthcheck._reconcile()
+            ngx.say("kept=", kept, " end=", status(b, 11111), " owner=", status(a, 11111))
+        }
+    }
+--- request
+GET /t
+--- response_body
+kept=true end=false owner=false
+--- no_error_log
+[error]
+
+
+
+=== TEST 6: a late event does not put back the status of a target whose state was read, in a comparison that could not read another
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local shm = ngx.shared.test_shm
+            local a, b = new_checker(), new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(a:add_target(ip, 22222, nil, true))
+            assert(a:add_target(ip, 33333, nil, true))
+            flush_events()
+            assert(#a.targets == 3 and #b.targets == 3)
+            healthcheck._reconcile()
+            local we = events()
+            local out = {}
+            -- the first comparison is one of the members, the second one of
+            -- the statuses
+            for round, port in ipairs({ 22222, 33333 }) do
+                local _, held = hold_events(function()
+                    assert(a:set_target_status(ip, port, nil, false))
+                    assert(a:set_target_status(ip, port, nil, true))
+                end)
+                -- as evicted from a full shm
+                shm:delete(key_of(a.TARGET_STATE, 11111))
+                local before = stats()
+                healthcheck._reconcile()
+                local ver = b.status_ver
+                -- the first of the two events arrives, the second is lost
+                we.post(held[1][1], held[1][2], held[1][3])
+                flush_events()
+                out[round] = "members=" .. since(before, "members") .. " " .. status(b, port)
+                             .. " status_ver+" .. (b.status_ver - ver)
+            end
+            ngx.say(table.concat(out, "; "))
+        }
+    }
+--- request
+GET /t
+--- response_body
+members=2 true status_ver+0; members=0 true status_ver+0
+--- no_error_log
+[error]
+
+
+
+=== TEST 7: without the list, the event of a target that was added is applied when it comes after the comparison
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local shm = ngx.shared.test_shm
+            local a, b = new_checker(), new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(a:add_target(ip, 22222, nil, true))
+            assert(a:add_target(ip, 33333, nil, true))
+            flush_events()
+            assert(#a.targets == 3 and #b.targets == 3)
+            healthcheck._reconcile()
+            local send = hold_events(function()
+                assert(a:add_target(ip, 44444, nil, true))
+            end)
+            -- as evicted from a full shm
+            shm:delete(a.TARGET_LIST)
+            healthcheck._reconcile()
+            local kept = #b.targets .. " " .. status(b, 44444)
+            send()
+            flush_events()
+            ngx.say("after the comparison: ", kept, "; after the late event: ", #b.targets, " ",
+                    status(b, 44444))
+        }
+    }
+--- request
+GET /t
+--- response_body
+after the comparison: 3 nil/target not found; after the late event: 4 true
+--- no_error_log
+[error]
+
+
+
+=== TEST 8: once a comparison reads everything again, late events are ignored again
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local shm = ngx.shared.test_shm
+            local a, b = new_checker(), new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(a:add_target(ip, 22222, nil, true))
+            assert(a:add_target(ip, 33333, nil, true))
+            flush_events()
+            assert(#a.targets == 3 and #b.targets == 3)
+            healthcheck._reconcile()
+            lose_events(function()
+                assert(a:set_target_status(ip, 11111, nil, false))
+            end)
+            -- as evicted from a full shm
+            shm:delete(key_of(a.TARGET_STATE, 11111))
+            healthcheck._reconcile()
+            local unset = b.version_applied == nil
+            -- until then, the run that follows an event compares the checker
+            assert(a:set_target_status(ip, 22222, nil, false))
+            flush_events()
+            local before = stats()
+            healthcheck._reconcile()
+            local unread = since(before, "compared")
+            -- the next change of the target writes its state again
+            assert(a:set_target_status(ip, 11111, nil, false))
+            flush_events()
+            healthcheck._reconcile()
+            local set = b.version_applied == shm:get(b.TARGET_VERSION)
+            local send = hold_events(function()
+                assert(a:set_target_status(ip, 22222, nil, true))
+            end)
+            healthcheck._reconcile()
+            send()
+            flush_events()
+            before = stats()
+            healthcheck._reconcile()
+            ngx.say("unset=", tostring(unset), " compared after an event=", unread,
+                    " set again=", tostring(set),
+                    " compared after a late event=", since(before, "compared"),
+                    " ", status(b, 11111), ",", status(b, 22222))
+        }
+    }
+--- request
+GET /t
+--- response_body
+unset=true compared after an event=2 set again=true compared after a late event=0 false,true
+--- no_error_log
+[error]
+
+
+
+=== TEST 9: a checker created while the state of a target cannot be read takes the late event of its change, and no older one for the others
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local shm = ngx.shared.test_shm
+            local a = new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(a:add_target(ip, 22222, nil, true))
+            flush_events()
+            local _, held = hold_events(function()
+                assert(a:set_target_status(ip, 11111, nil, false))
+                assert(a:set_target_status(ip, 22222, nil, false))
+                assert(a:set_target_status(ip, 22222, nil, true))
+            end)
+            -- as evicted from a full shm
+            shm:delete(key_of(a.TARGET_STATE, 11111))
+            local b = new_checker()
+            local function health(port)
+                return tostring(b.targets[ip][port][ip].internal_health)
+            end
+            local loaded = health(11111) .. "," .. health(22222)
+            -- the last of the three events is lost
+            local we = events()
+            we.post(held[1][1], held[1][2], held[1][3])
+            we.post(held[2][1], held[2][2], held[2][3])
+            flush_events()
+            ngx.say("loaded=", loaded, " after the late events=", health(11111), ",", health(22222))
+        }
+    }
+--- request
+GET /t
+--- response_body
+loaded=nil,healthy after the late events=unhealthy,healthy
+--- no_error_log
+[error]
+
+
+
+=== TEST 10: a version key that was made again from an earlier time does not keep the events of a target out
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local shm = ngx.shared.test_shm
+            local a, b = new_checker(), new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(a:add_target(ip, 22222, nil, true))
+            assert(a:add_target(ip, 33333, nil, true))
+            flush_events()
+            assert(#a.targets == 3 and #b.targets == 3)
+            healthcheck._reconcile()
+            -- as evicted from a full shm, and made again after the clock was
+            -- set back
+            shm:set(a.TARGET_VERSION, shm:get(a.TARGET_VERSION) - 5000)
+            lose_events(function()
+                assert(a:set_target_status(ip, 22222, nil, false))
+            end)
+            shm:delete(key_of(a.TARGET_STATE, 11111))
+            healthcheck._reconcile()
+            local compared = status(b, 11111) .. "," .. status(b, 22222)
+            assert(a:set_target_status(ip, 11111, nil, false))
+            flush_events()
+            -- before the next run of the timer: by the event alone
+            ngx.say("after the comparison=", compared, " after the event=", status(b, 11111))
+        }
+    }
+--- request
+GET /t
+--- response_body
+after the comparison=true,false after the event=false
+--- no_error_log
+[error]
+
+
+
+=== TEST 11: a target that is listed without a state is added by the event of its change, and keeps the latest one
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local shm = ngx.shared.test_shm
+            local a, b = new_checker(), new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(a:add_target(ip, 22222, nil, true))
+            assert(a:add_target(ip, 33333, nil, true))
+            flush_events()
+            assert(#a.targets == 3 and #b.targets == 3)
+            healthcheck._reconcile()
+            local we = events()
+            -- only the owner gets the event of the new target
+            we.unregister(b.ev_callback, b.EVENT_SOURCE)
+            assert(a:add_target(ip, 44444, nil, true))
+            flush_events()
+            we.register(b.ev_callback, b.EVENT_SOURCE)
+            local _, held = hold_events(function()
+                assert(a:set_target_status(ip, 44444, nil, false))
+                assert(a:set_target_status(ip, 44444, nil, true))
+            end)
+            -- as evicted from a full shm
+            shm:delete(key_of(a.TARGET_STATE, 44444))
+            healthcheck._reconcile()
+            local compared = status(b, 44444)
+            -- the event of the second change arrives before the first
+            we.post(held[2][1], held[2][2], held[2][3])
+            flush_events()
+            we.post(held[1][1], held[1][2], held[1][3])
+            flush_events()
+            ngx.say("after the comparison=", compared, " after the late events=", status(b, 44444))
+        }
+    }
+--- request
+GET /t
+--- response_body
+after the comparison=nil/target not found after the late events=true
+--- no_error_log
+[error]
+
+
+
+=== TEST 12: a checker without a list and without a target has nothing left to read
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local a = new_checker()
+            a:stop()
+            a:start()
+            local before = stats()
+            healthcheck._reconcile()
+            ngx.say("compared=", since(before, "compared"), " version_applied is the version in shm=",
+                    tostring(a.version_applied == ngx.shared.test_shm:get(a.TARGET_VERSION)))
+        }
+    }
+--- request
+GET /t
+--- response_body
+compared=1 version_applied is the version in shm=true
+--- no_error_log
+[error]

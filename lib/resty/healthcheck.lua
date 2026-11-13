@@ -1700,6 +1700,15 @@ end
 -- A comparison yields after every SYNC_BATCH units of work, and only one runs
 -- at a time in a worker. While a checker is being compared, the events for it
 -- are kept and applied when the comparison is done.
+--
+-- A comparison covers the changes up to the version it read first, so their
+-- events are ignored when they come late: `version_applied`. That only holds
+-- when shm told everything. When the state key of a listed target, or the
+-- list, was evicted from a full shm, the events are the only source left:
+-- `version_applied` is unset, every event is applied and followed by a
+-- comparison, until one reads everything again. Each target also keeps the
+-- version of the last change the copy took for it (`target.version`), so that
+-- an event that is older than that does not put an old status back.
 ------------------------------------------------------------------------------
 
 local RECONCILE_INTERVAL = CHECK_INTERVAL
@@ -1924,7 +1933,30 @@ local function on_event(self, event, data)
         resync_pending[self] = true
       end
     else
+      -- the last comparison could not read everything from shm (or there is
+      -- no version to go by): what it missed may be in this event
       resync_pending[self] = true
+    end
+
+    local ip = data.ip
+    if ip then
+      -- The changes of one target are applied in their order: an event that
+      -- is older than what the copy has for the target, from a later event
+      -- or from shm, would put an old status back.
+      local port, hostname = data.port, data.hostname
+      local target = get_target(self, ip, port, hostname)
+      local seen = target and target.version
+      if seen and version <= seen then
+        return
+      end
+
+      self:event_handler(event, ip, port, hostname)
+
+      target = target or get_target(self, ip, port, hostname)
+      if target then
+        target.version = version
+      end
+      return
     end
   end
   -- an event without a version comes from a worker that runs an older version
@@ -1950,14 +1982,32 @@ local function sync_spend(budget, units)
 end
 
 
+-- A target whose state could not be read from shm in a comparison at
+-- `version`: what the copy has for it stays, and so does the version of it,
+-- unless that is from before the version key was made again from an earlier
+-- time (see STALE_VERSION_GAP), when it would keep later events out.
+local function sync_unread(target, version)
+  local seen = target.version
+  if seen and (not version or seen > version) then
+    target.version = version
+  end
+end
+
+
 -- The body of `sync_from_shm`: see there. `self.syncing` is set, so the copy
 -- only changes here, or under `clear()` and `stop()`, which end the pass.
--- @return the number of corrections, or `false` when the pass was cut short.
-local function sync_targets(self, budget, raw, members)
+-- `version` is the version of the checker that was read before anything else.
+-- @return the number of corrections, and whether shm told everything (`false`
+-- when the list, or the state of a listed target, was not there); or `false`
+-- when the pass was cut short.
+local function sync_targets(self, budget, raw, members, version)
   local shm, events = self.shm, self.events
   local targets = self.targets
   local state_prefix = self.TARGET_STATE
   local corrected = 0
+  -- without a list nothing tells which targets are listed (a checker that
+  -- has no target either has nothing to compare)
+  local covered = raw ~= nil or targets[1] == nil
 
   if not members then
     -- same members as when they were last compared: only the statuses
@@ -1966,10 +2016,16 @@ local function sync_targets(self, budget, raw, members)
     while target do
       local state = INTERNAL_STATES[shm:get(key_for(state_prefix, target.ip, target.port,
                                                     target.hostname))]
-      -- a state key evicted from a full shm tells nothing: the copy is kept
-      if state and state ~= target.internal_health then
-        self:event_handler(events[state], target.ip, target.port, target.hostname)
-        corrected = corrected + 1
+      if state then
+        if state ~= target.internal_health then
+          self:event_handler(events[state], target.ip, target.port, target.hostname)
+          corrected = corrected + 1
+        end
+        target.version = version
+      else
+        -- a state key evicted from a full shm tells nothing: the copy is kept
+        covered = false
+        sync_unread(target, version)
       end
       if sync_spend(budget, 1) and (self.targets ~= targets or self.stopped) then
         return false
@@ -1977,7 +2033,7 @@ local function sync_targets(self, budget, raw, members)
       i = i + 1
       target = targets[i]
     end
-    return corrected
+    return corrected, covered
   end
 
   local list = deserialize(raw)
@@ -2001,10 +2057,18 @@ local function sync_targets(self, budget, raw, members)
         corrected = corrected + 1
         target = target or get_target(self, ip, port, hostname)
       end
-    elseif not target then
-      -- listed, but its state key was evicted: it cannot be added without a
-      -- status, so the members are compared again next time
-      complete = false
+      if target then
+        target.version = version
+      end
+    else
+      covered = false
+      if target then
+        sync_unread(target, version)
+      else
+        -- listed, but its state key was evicted: it cannot be added without
+        -- a status, so the members are compared again next time
+        complete = false
+      end
     end
     if target then
       target.sync_mark = mark
@@ -2049,7 +2113,7 @@ local function sync_targets(self, budget, raw, members)
   self.synced_list = complete and raw or nil
   sync_spend(budget, count / 8)
 
-  return corrected
+  return corrected, covered
 end
 
 
@@ -2085,11 +2149,15 @@ local function sync_from_shm(self, budget)
   end
 
   self.syncing = true
-  local ok, corrected = pcall(sync_targets, self, budget, raw, members)
+  local ok, corrected, covered = pcall(sync_targets, self, budget, raw, members, version)
   self.syncing = nil
 
   if ok and corrected then
-    self.version_applied = version
+    -- What shm could not tell may still come in an event that is late: only
+    -- a comparison that read everything covers the changes up to its
+    -- version. After any other, every event is applied and followed by a
+    -- comparison (see `on_event`).
+    self.version_applied = covered and version or nil
   end
 
   -- the events that arrived meanwhile
@@ -2631,7 +2699,8 @@ function _M.new(opts)
   -- top of it.
   track_shm_version(self)
   self.shm:add(self.TARGET_VERSION, version_init())
-  self.version_applied = self.shm:get(self.TARGET_VERSION)
+  local loaded_version = self.shm:get(self.TARGET_VERSION)
+  self.version_applied = loaded_version
 
   -- load the initial target list, and register for events directly after:
   -- order is important!
@@ -2648,6 +2717,14 @@ function _M.new(opts)
         target.internal_health = INTERNAL_STATES[self.shm:get(state_key)]
         self:log(DEBUG, "Got initial status ", target.internal_health, " ",
                         target.hostname, " ", target.ip, ":", target.port)
+        if target.internal_health then
+          target.version = loaded_version
+        else
+          -- its state key was evicted from a full shm: the event of its last
+          -- change can still tell when it is late, so no event is taken for
+          -- covered by this load
+          self.version_applied = nil
+        end
         -- fill-in the hash part for easy lookup
         self.targets[target.ip] = self.targets[target.ip] or {}
         self.targets[target.ip][target.port] = self.targets[target.ip][target.port] or {}
