@@ -634,3 +634,45 @@ GET /t
 false nil
 --- no_error_log eval
 qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 14: set_target_status() for a target removed meanwhile writes nothing, raises no event and does not log "forced"
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local we = require "resty.events.compat"
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            local shm = ngx.shared.test_shm
+            local state_key = checker.TARGET_STATE .. ":127.0.0.1:11111:127.0.0.1"
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
+
+            -- another worker removes the target; this worker's copy still has
+            -- it. Nothing below yields, so the timer cannot run meanwhile.
+            we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
+            assert(checker:remove_target("127.0.0.1", 11111, "127.0.0.1"))
+            local version = shm:get(checker.TARGET_VERSION)
+            local ok = checker:set_target_status("127.0.0.1", 11111, nil, false)
+            ngx.say(tostring(ok), " state=", tostring(shm:get(state_key)),
+                    " announced=", tostring(shm:get(checker.TARGET_VERSION) ~= version))
+        }
+    }
+--- request
+GET /t
+--- response_body
+true state=nil announced=false
+--- no_error_log
+unhealthy forced for
