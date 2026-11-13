@@ -137,8 +137,16 @@ nil/target not found 1 | nil/target not found 1 | 1
             local a, b = new_checker(), new_checker()
             ngx.sleep(0.2)
             local ver_a, ver_b = a.status_ver, b.status_ver
+            -- the clear event is seen delivered before the versions are read
+            local delivered = false
+            local we = require "resty.worker.events"
+            we.register(function(_, event)
+                if event == "clear" then
+                    delivered = true
+                end
+            end, a.EVENT_SOURCE)
             assert(a:clear())
-            ngx.sleep(0.3)
+            assert(wait_until(function() return delivered end))
             b:event_handler("remove", "127.0.0.1", 11111, "127.0.0.1")
             ngx.say(a.status_ver == ver_a, " ", b.status_ver == ver_b)
         }

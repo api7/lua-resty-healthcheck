@@ -67,8 +67,10 @@ while not full do
         local i = targets + 1
         local ip = "10." .. (math.floor(i / 62500) % 250) .. "." .. (math.floor(i / 250) % 250) .. "." .. (i % 250)
         local host = hostname(i)
-        local ok = checker:add_target(ip, 8080, host, true)
-        if full or not ok then break end
+        local ok, err = checker:add_target(ip, 8080, host, true)
+        if full then break end
+        -- any other failure would leave the loop adding nothing for ever
+        assert(ok, "add_target() failed: " .. tostring(err))
         if with_counters then
             -- one failed request: creates the counter key (the threshold is 3)
             checker:report_http_status(ip, 8080, host, 500, "passive")
