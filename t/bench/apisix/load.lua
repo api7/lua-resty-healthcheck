@@ -2,7 +2,8 @@
 --   UPSTREAMS routes exist (/hello/<n>); every worker first serves each of
 --   them once, so that it has a checker for each upstream; then CONNS
 --   connections request the first HOT routes in turn for DURATION seconds.
--- Prints one line of JSON: requests, requests per second, latency (ms), the
+-- Prints one line of JSON: requests, requests per second, latency (ms, and
+-- the number of requests that took more than 5 and 10 ms), the
 -- CPU time of the nginx workers as a share of one core each, the health check
 -- events seen and lost by the workers, and the counters of the reconciliation
 -- where the library has them.
@@ -123,10 +124,20 @@ local cpu1 = worker_cpu()
 local after = hookstats()
 table.sort(lat)
 local function pct(p) return lat[math.max(1, math.ceil(count * p))] / 1000 end
+-- how many requests took longer than `ms`
+local function slower_than(ms)
+    local lo, hi = 1, count + 1
+    while lo < hi do
+        local mid = math.floor((lo + hi) / 2)
+        if lat[mid] > ms * 1000 then hi = mid else lo = mid + 1 end
+    end
+    return count - lo + 1
+end
 local out = {
     requests = count, reconnects = reconnects, non_200 = non200,
     rps = math.floor(count / elapsed),
-    p50_ms = pct(0.50), p99_ms = pct(0.99), p999_ms = pct(0.999), max_ms = lat[count] / 1000,
+    p50_ms = pct(0.50), p99_ms = pct(0.99), p999_ms = pct(0.999), p9999_ms = pct(0.9999),
+    max_ms = lat[count] / 1000, over_5ms = slower_than(5), over_10ms = slower_than(10),
     worker_cpu_percent = (cpu1 - cpu0) / 100 / elapsed / nworkers * 100,   -- 100 ticks a second
     workers = nworkers,
 }
