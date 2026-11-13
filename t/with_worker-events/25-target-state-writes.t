@@ -122,7 +122,7 @@ listed=0 a=nil/target not found state=nil counter=nil
 
 
 
-=== TEST 2: set_target_status() for a target that another worker removed writes nothing, raises no event and does not log "forced"
+=== TEST 2: set_target_status() for a target that another worker removed writes nothing, not even a counter, raises no event and does not log "forced"
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -145,13 +145,14 @@ listed=0 a=nil/target not found state=nil counter=nil
             we.register(count, a.EVENT_SOURCE)
             local ok = b:set_target_status(ip, 11111, nil, false)
             ngx.sleep(0.3)
-            ngx.say(tostring(ok), " state=", tostring(shm:get(state_key)), " events=", events)
+            ngx.say(tostring(ok), " state=", tostring(shm:get(state_key)), " events=", events,
+                    " counter=", tostring(shm:get(key_of(a.TARGET_COUNTER, 11111))))
         }
     }
 --- request
 GET /t
 --- response_body
-true state=nil events=0
+true state=nil events=0 counter=nil
 --- no_error_log eval
 qr/unhealthy forced for|\[error\]/
 
@@ -274,7 +275,8 @@ a=true state=2
             we.register(function(_, event) events[#events + 1] = event end, a.EVENT_SOURCE)
             -- the caller says healthy, as callers do by default
             assert(a:add_target(ip, 11111, nil, true))
-            ngx.sleep(0.3)
+            assert(wait_until(function() return #events > 0 end))
+            ngx.sleep(0.1)   -- room for a second event, which must not come
             ngx.say("state=", tostring(shm:get(state_key)), " events=", table.concat(events, ","),
                     " a=", status(a, 11111))
         }
@@ -637,7 +639,8 @@ listed=1 one=nil/target not found state=nil two=true
             local events = {}
             we.register(function(_, event) events[#events + 1] = event end, c.EVENT_SOURCE)
             assert(c:add_target(ip, 11111, nil, true))
-            ngx.sleep(0.3)
+            assert(wait_until(function() return #events > 0 end))
+            ngx.sleep(0.1)   -- room for a second event, which must not come
             ngx.say("state=", tostring(shm:get(state_key)), " events=", table.concat(events, ","))
         }
     }
