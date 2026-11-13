@@ -92,7 +92,8 @@ for the complete API.
 All checkers that use the same `shm_name` keep their data in that
 `lua_shared_dict`. Apache APISIX uses one dictionary for all its checkers:
 `upstream-healthcheck`, 10m by default, set under
-`nginx_config.meta.lua_shared_dict` in its `config.yaml`.
+`nginx_config.meta.lua_shared_dict` in its `config.yaml` (APISIX 3.16 and
+later; `nginx_config.http.lua_shared_dict` before).
 
 What is stored:
 
@@ -107,18 +108,24 @@ length of its key, which contains the name of the checker and the ip, port and
 hostname of the target. 256 bytes is what the names used in the measurements
 below need.
 
-A shm that is full does not refuse a write: it evicts the entries that were
-used least recently, which can be the state of another target or the target
-list of another checker. This library logs it when one of its writes evicts
-entries or fails (`shm '<name>' is full: ...`), and when a checker finds that
-its target list is gone (`shm '<name>' no longer has the target list of
-checker ...`), at most once a minute for each shm in each worker.
+A write to a shm that is full first evicts the entries that were used least
+recently, up to 30 of them, which can be the state of another target or the
+target list of another checker. If that does not free a large enough block,
+the write fails with `no memory`, after those evictions and after the value
+the key had before was removed: an `add_target()` that fails this way leaves
+its checker without a target list in the shm. This library logs it when one
+of its writes evicts entries (a warning) or fails (an error), both as `shm
+'<name>' is full: ...`, and when a checker finds that its target list is gone
+(an error, `shm '<name>' no longer has the target list of checker ...`), each
+at most once a minute for each shm in each worker.
 
 How many targets fit depends on how they are spread over the checkers,
 because the target list of a checker is one value: it needs a run of
 contiguous free pages, and it is written again, one entry longer, every time
 a target is added. Measured in a 10m dictionary, with checkers named as APISIX
-names them and targets added until the first write that evicted an entry:
+names them and targets added until the first write that evicted entries or
+failed (in all rows but the first and the fifth it was a write of a target
+list that failed):
 
 | Targets per checker | Counters | Bytes per target | Targets when the shm was full | Free pages left then |
 |---|---|---|---|---|
