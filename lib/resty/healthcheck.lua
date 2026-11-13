@@ -770,26 +770,26 @@ local function ctr_get(multictr, idx)
 end
 
 
--- Tells whether a target is in the target list in shm. Every change writes
--- the list, so a missing list was evicted from a full shm: the target is then
--- assumed to be listed.
--- @return `true` or `false`, or `nil + error`.
-local function is_listed(self, ip, port, hostname)
+-- Tells whether a target is in the target list in shm, which decides
+-- membership. Every change writes the list, so a missing list was evicted
+-- from a full shm: membership is then unknown.
+-- @return `"listed"`, `"unlisted"` or `"unknown"`, or `nil + error`.
+local function target_membership(self, ip, port, hostname)
   local raw, err = self.shm:get(self.TARGET_LIST)
   if err then
     return nil, "failed to fetch target_list from shm: " .. err
   end
   if raw == nil then
-    return true
+    return "unknown"
   end
   for _, target in ipairs(deserialize(raw)) do
     if target.ip == ip and target.port == port
        and (target.hostname or target.ip) == hostname
     then
-      return true
+      return "listed"
     end
   end
-  return false
+  return "unlisted"
 end
 
 
@@ -809,12 +809,16 @@ local function write_target_state(self, ip, port, hostname, state)
   end
 
   -- no state: the target was removed, or its state key was evicted from a
-  -- full shm while it is still listed, and then it is written again
-  local listed, list_err = is_listed(self, ip, port, hostname)
-  if listed == nil then
+  -- full shm while it is still listed, and then it is written again. When
+  -- the list was evicted too, the state is written as well, so that health
+  -- changes keep working: a state alone never adds a target to a worker's
+  -- copy, so one written for a target that was in fact removed changes
+  -- nothing.
+  local membership, list_err = target_membership(self, ip, port, hostname)
+  if not membership then
     return nil, list_err
   end
-  if not listed then
+  if membership == "unlisted" then
     return false
   end
 
@@ -1086,12 +1090,10 @@ function checker:set_target_status(ip, port, hostname, is_healthy)
   end
 
   local counter_key = key_for(self.TARGET_COUNTER, ip, port, hostname)
-  local written
 
   local ok, err = locking_target(self, ip, port, hostname, function()
 
-    local write_err
-    written, write_err = write_target_state(self, ip, port, hostname, health_report)
+    local written, write_err = write_target_state(self, ip, port, hostname, health_report)
     if written == nil then
       return nil, write_err
     end
@@ -1102,6 +1104,7 @@ function checker:set_target_status(ip, port, hostname, is_healthy)
 
     -- the state is changed: announce it before anything else can fail
     self:raise_event(self.events[health_report], ip, port, hostname)
+    self:log(WARN, health_report, " forced for ", hostname, " ", ip, ":", port)
 
     local _, err = self.shm:set(counter_key, 0)
     if err then
@@ -1112,9 +1115,6 @@ function checker:set_target_status(ip, port, hostname, is_healthy)
 
   end)
 
-  if written then
-    self:log(WARN, health_report, " forced for ", hostname, " ", ip, ":", port)
-  end
   return ok, err
 end
 
@@ -2025,9 +2025,7 @@ function _M.new(opts)
       local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
       local state = INTERNAL_STATES[self.shm:get(state_key)]
       local known = get_target(self, ip, port, hostname) ~= nil
-      if known and state then
-        -- also for a remove: the target is back in shm, so that remove is
-        -- stale and the current state applies
+      if known and state and event ~= EVENTS.remove then
         self:event_handler(EVENTS[state], ip, port, hostname)
         return
       end
@@ -2035,21 +2033,30 @@ function _M.new(opts)
         return
       end
 
-      -- the target comes or goes: the target list decides, not the state
+      -- the target may come or go: the target list decides, not the state
       -- key alone (a state can be left behind for a removed target, and a
       -- state key can be evicted for a listed one)
-      local listed, err = is_listed(self, ip, port, hostname)
-      if listed == nil then
+      local membership, err = target_membership(self, ip, port, hostname)
+      if not membership then
         -- left to the reconcile timer
         self.resync_pending = true
         self:log(ERR, "failed to reconcile targets with shm: ", err)
         return
       end
-      if state and listed then
+      if membership == "unlisted" then
+        if known then
+          self:event_handler(EVENTS.remove, ip, port, hostname)
+        end
+
+      elseif state and (known or membership == "listed") then
+        -- also for a remove: the target is listed (or the list was evicted
+        -- and this worker still has the target), so that remove is stale and
+        -- the current state applies. A target this worker does not have is
+        -- added only when it is listed, never from a state alone.
         self:event_handler(EVENTS[state], ip, port, hostname)
-      elseif known and not listed then
-        self:event_handler(EVENTS.remove, ip, port, hostname)
       end
+      -- otherwise the local copy is kept as it is: a listed target whose
+      -- state key was evicted, or a state without a listed target
     end
 
     -- handle events to sync up in case there was a change by another worker

@@ -222,24 +222,48 @@ failed to bump the target version: no memory
                 },
             })
             assert(checker:add_target("127.0.0.1", 11111, nil, true))
-            ngx.sleep(0.5)
 
-            -- nothing changes: only the full resyncs run, every 0.2 s, and not
-            -- on every run of the timer (every 0.1 s)
-            local syncs = 0
+            -- counts the full resyncs, and the runs of the reconcile timer
+            -- (each run reads the version shared by the shm once)
+            local syncs, runs = 0, 0
             local orig_sync = checker.sync_from_shm
             checker.sync_from_shm = function(...)
                 syncs = syncs + 1
                 return orig_sync(...)
             end
-            ngx.sleep(1)
-            ngx.say(syncs >= 1, " ", syncs <= 6)
+            local shdict_methods = getmetatable(ngx.shared.test_shm).__index
+            local orig_get = shdict_methods.get
+            shdict_methods.get = function(dict, key, ...)
+                if key == checker.GLOBAL_TARGET_VERSION then
+                    runs = runs + 1
+                end
+                return orig_get(dict, key, ...)
+            end
+            local function wait_for(cond, timeout)
+                local deadline = ngx.now() + timeout
+                while not cond() and ngx.now() < deadline do
+                    ngx.sleep(0.01)
+                    ngx.update_time()
+                end
+                return cond()
+            end
+
+            -- let the changes above settle, up to the checker's first turn;
+            -- from then on nothing changes, so only full resyncs run: every
+            -- 0.2 s, that is every other run of the timer (0.1 s), not each
+            local first = wait_for(function() return syncs >= 1 end, 3)
+            ngx.sleep(0.3)
+            syncs, runs = 0, 0
+            local enough = wait_for(function() return runs >= 10 end, 5)
+            shdict_methods.get = orig_get
+            ngx.say(tostring(first), " ", tostring(enough), " ", syncs >= 1, " ",
+                    syncs * 10 <= runs * 7)
         }
     }
 --- request
 GET /t
 --- response_body
-true true
+true true true true
 --- no_error_log eval
 qr/\[error\](?!.*lua tcp socket read timed out)/
 --- timeout: 6

@@ -417,7 +417,7 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
 
 
 
-=== TEST 9: a state change writes the state key again when the target list was evicted too
+=== TEST 9: a state change still writes the state when the target list was evicted with the state key
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -439,16 +439,20 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
             assert(checker:add_target("127.0.0.1", 11111, nil, true))
             assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
 
+            -- health changes keep working for the workers that have the
+            -- target (TEST 11: such a state never adds a target elsewhere)
             shm:delete(state_key)
             shm:delete(checker.TARGET_LIST)
             assert(checker:set_target_status("127.0.0.1", 11111, nil, false))
-            ngx.say("state=", tostring(shm:get(state_key)))
+            wait_until(function() return checker:get_target_status("127.0.0.1", 11111) == false end)
+            ngx.say("state=", tostring(shm:get(state_key)), " local=",
+                    tostring(checker:get_target_status("127.0.0.1", 11111)))
         }
     }
 --- request
 GET /t
 --- response_body
-state=2
+state=2 local=false
 --- no_error_log eval
 qr/\[error\](?!.*lua tcp socket read timed out)/
 
@@ -498,5 +502,135 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
 GET /t
 --- response_body
 nil failed to store target_list in shm: no memory state=nil
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 11: a late event for a removed target whose state was left behind does not bring it back when the list was evicted
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            local shm = ngx.shared.test_shm
+            local state_key = checker.TARGET_STATE .. ":127.0.0.1:11111:127.0.0.1"
+            local target = { ip = "127.0.0.1", port = 11111, hostname = "127.0.0.1" }
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
+            assert(checker:remove_target("127.0.0.1", 11111, "127.0.0.1"))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) == nil end))
+
+            -- a state left behind, the list evicted, and a late event
+            assert(shm:set(state_key, 1))
+            shm:delete(checker.TARGET_LIST)
+            checker.ev_callback(target, checker.events.healthy)
+            local ok, err = checker:get_target_status("127.0.0.1", 11111)
+            ngx.say(tostring(ok), " ", tostring(err))
+        }
+    }
+--- request
+GET /t
+--- response_body
+nil target not found
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 12: a remove event drops a target that is no longer listed, even if a state was left behind for it
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            local shm = ngx.shared.test_shm
+            local state_key = checker.TARGET_STATE .. ":127.0.0.1:11111:127.0.0.1"
+            local target = { ip = "127.0.0.1", port = 11111, hostname = "127.0.0.1" }
+            local we = require "resty.events.compat"
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
+
+            -- another worker removes the target; a state is left behind for
+            -- it, and this worker, whose copy still has it, gets the remove.
+            -- Nothing below yields, so the timer cannot run meanwhile.
+            we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
+            assert(checker:remove_target("127.0.0.1", 11111, "127.0.0.1"))
+            assert(shm:set(state_key, 1))
+            local before = checker:get_target_status("127.0.0.1", 11111)
+            checker.ev_callback(target, checker.events.remove)
+            local ok, err = checker:get_target_status("127.0.0.1", 11111)
+            ngx.say("before=", tostring(before), " after=", tostring(ok), " ", tostring(err))
+        }
+    }
+--- request
+GET /t
+--- response_body
+before=true after=nil target not found
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 13: a remove event with the target list evicted keeps a target this worker has, with its shm state
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local checker = healthcheck.new({
+                name = "testing",
+                shm_name = "test_shm",
+                events_module = "resty.events",
+                checks = {
+                    active = {
+                        healthy = { interval = 0 },
+                        unhealthy = { interval = 0 },
+                    },
+                },
+            })
+            local shm = ngx.shared.test_shm
+            local state_key = checker.TARGET_STATE .. ":127.0.0.1:11111:127.0.0.1"
+            local target = { ip = "127.0.0.1", port = 11111, hostname = "127.0.0.1" }
+            local we = require "resty.events.compat"
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
+
+            -- nothing tells whether the target is still listed: it is kept,
+            -- and its current state applies. Nothing below yields.
+            we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
+            assert(shm:set(state_key, 2))
+            shm:delete(checker.TARGET_LIST)
+            checker.ev_callback(target, checker.events.remove)
+            local ok, err = checker:get_target_status("127.0.0.1", 11111)
+            ngx.say(tostring(ok), " ", tostring(err))
+        }
+    }
+--- request
+GET /t
+--- response_body
+false nil
 --- no_error_log eval
 qr/\[error\](?!.*lua tcp socket read timed out)/

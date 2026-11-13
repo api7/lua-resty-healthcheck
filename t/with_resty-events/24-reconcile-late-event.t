@@ -113,7 +113,7 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
             if ngx.re.match(events_version, [[^0\.1\.]], "jo") then
                 ngx.log(ngx.WARN, "skipped: lua-resty-events ", events_version,
                         " has no max_queue_len")
-                ngx.say("shm=healthy local=true overflowed=true delivered=unhealthy@healthy")
+                ngx.say("shm=healthy local=true overflowed=true delivered=unhealthy@healthy+reconciled")
                 return
             end
 
@@ -133,15 +133,19 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
             assert(checker:add_target("127.0.0.1", 11111, nil, true))
             ngx.sleep(0.3)
 
-            -- records which events of the target reach the checker, and what
-            -- shm holds at that moment
+            -- records which events of the target reach the checker, what shm
+            -- holds at that moment, and whether the timer has already
+            -- reconciled the latest change (it records the version it synced)
+            local shm = ngx.shared.test_shm
             local state_key = checker.TARGET_STATE .. ":127.0.0.1:11111:127.0.0.1"
             local deliveries = {}
             local function spy(data, event, ...)
                 if data.port == 11111 then
-                    local state = ngx.shared.test_shm:get(state_key)
+                    local state = shm:get(state_key)
+                    local reconciled = checker.version_seen == shm:get(checker.TARGET_VERSION)
                     deliveries[#deliveries + 1] = event .. "@" .. tostring(state and
                         ({ "healthy", "unhealthy", "mostly_healthy", "mostly_unhealthy" })[state])
+                        .. (reconciled and "+reconciled" or "+pending")
                 end
                 return checker.ev_callback(data, event, ...)
             end
@@ -172,13 +176,14 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
                     -- some events were dropped: the scenario did happen
                     " overflowed=", tostring(fast_delivered < 6),
                     -- only E1 reached the checker, after E2's change was in shm
+                    -- and reconciled by the timer
                     " delivered=", table.concat(deliveries, ","))
         }
     }
 --- request
 GET /t
 --- response_body
-shm=healthy local=true overflowed=true delivered=unhealthy@healthy
+shm=healthy local=true overflowed=true delivered=unhealthy@healthy+reconciled
 --- no_error_log
 failed to reconcile
 --- timeout: 8

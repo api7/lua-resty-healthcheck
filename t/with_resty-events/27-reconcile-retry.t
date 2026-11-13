@@ -177,3 +177,60 @@ before=true corrected=true true
 --- error_log
 failed to reconcile targets with shm: failed to fetch target_list from shm: injected failure
 --- timeout: 6
+
+
+
+=== TEST 3: a reconcile timer that could not be created is created by the next new()
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local we = require "resty.events.compat"
+            local healthcheck = require("resty.healthcheck")
+            local function new_checker(name)
+                return assert(healthcheck.new({
+                    name = name,
+                    shm_name = "test_shm",
+                    events_module = "resty.events",
+                    checks = {
+                        active = {
+                            healthy = { interval = 0 },
+                            unhealthy = { interval = 0 },
+                        },
+                    },
+                }))
+            end
+            -- e.g. too many pending timers
+            local orig_every = ngx.timer.every
+            ngx.timer.every = function()
+                return nil, "injected failure"
+            end
+            local checker = new_checker("testing")
+            ngx.timer.every = orig_every
+
+            assert(checker:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return checker:get_target_status("127.0.0.1", 11111) end))
+
+            -- without the timer, a missed event is not corrected
+            we.unregister(checker.ev_callback, checker.EVENT_SOURCE)
+            assert(checker:set_target_status("127.0.0.1", 11111, nil, false))
+            ngx.sleep(0.5)
+            local before = checker:get_target_status("127.0.0.1", 11111)
+
+            -- the next checker created in this worker starts the timer, which
+            -- serves every checker
+            local other = new_checker("other")
+            local corrected = wait_until(function()
+                return checker:get_target_status("127.0.0.1", 11111) == false
+            end)
+            ngx.say("before=", tostring(before), " corrected=", tostring(corrected),
+                    " ", other ~= nil)
+        }
+    }
+--- request
+GET /t
+--- response_body
+before=true corrected=true true
+--- error_log
+could not start the reconcile timer: injected failure
+--- timeout: 6
