@@ -112,7 +112,12 @@ copies with the shm:
 - When the shm is ahead, and still is 5 ms later (the events may be on their
   way), the worker reads the version of each of its checkers and compares the
   ones that are behind with the shm, target by target: statuses are taken
-  from the shm, targets are added and removed to match the target list.
+  from the shm, targets are added and removed to match the target list. An
+  event that is later than that is handled like a lost one, and ignored when
+  it comes. lua-resty-events pauses 50 ms after every 100 events a worker
+  sends, so this happens when changes come in bursts: such a run of the timer
+  costs one read per checker of the worker, and one comparison per checker
+  that changed.
 - In the background, every checker is also compared in turn whatever the
   versions say, which covers what versions cannot tell (a version key evicted
   from a full shm, a worker that still runs an older version of this library

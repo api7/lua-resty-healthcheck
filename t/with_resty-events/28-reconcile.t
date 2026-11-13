@@ -342,7 +342,7 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
 
 
 
-=== TEST 6: a comparison that fails is logged and tried again on the next runs
+=== TEST 6: a comparison that fails is tried again on the next runs, and logged once
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -376,8 +376,10 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
 GET /t
 --- response_body
 true failures left=0
---- error_log
-failed to reconcile targets with shm: failed to fetch target_list from shm: boom
+--- grep_error_log eval
+qr/failed to reconcile targets with shm \([^)]*\): .*boom/
+--- grep_error_log_out
+failed to reconcile targets with shm (it is tried again on every run of the timer): failed to fetch target_list from shm: boom
 
 
 
@@ -454,5 +456,61 @@ could not start the reconcile timer: no timers
 GET /t
 --- response_body
 true true true true
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 9: the timer runs every 0.1 s
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local interval
+            ngx.timer.every = function(delay)
+                interval = delay
+                return true
+            end
+            new_checker()
+            ngx.say(tostring(interval))
+        }
+    }
+--- request
+GET /t
+--- response_body
+0.1
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 10: an event of the checker that has the same name in another shm is not applied
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local shm = ngx.shared.test_shm
+            local a, b = new_checker(), new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(a:add_target(ip, 22222, nil, true))
+            assert(a:add_target(ip, 33333, nil, true))
+            flush_events()
+            assert(#a.targets == 3 and #b.targets == 3)
+            local c = new_checker("testing", "other_shm")
+            assert(c:add_target(ip, 11111, nil, true))
+            assert(wait_until(function() return status(c, 11111) == "true" end))
+            assert(a:set_target_status(ip, 11111, nil, false))
+            assert(wait_until(function()
+                return status(a, 11111) == "false" and status(b, 11111) == "false"
+            end))
+            ngx.sleep(0.3)
+            ngx.say("a=", status(a, 11111), " b=", status(b, 11111), " c=", status(c, 11111))
+        }
+    }
+--- request
+GET /t
+--- response_body
+a=false b=false c=true
 --- no_error_log eval
 qr/\[error\](?!.*lua tcp socket read timed out)/

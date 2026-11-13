@@ -326,7 +326,7 @@ true
 
 
 
-=== TEST 6: a comparison that fails is logged and tried again on the next runs
+=== TEST 6: a comparison that fails is tried again on the next runs, and logged once
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -360,8 +360,10 @@ true
 GET /t
 --- response_body
 true failures left=0
---- error_log
-failed to reconcile targets with shm: failed to fetch target_list from shm: boom
+--- grep_error_log eval
+qr/failed to reconcile targets with shm \([^)]*\): .*boom/
+--- grep_error_log_out
+failed to reconcile targets with shm (it is tried again on every run of the timer): failed to fetch target_list from shm: boom
 
 
 
@@ -438,5 +440,113 @@ could not start the reconcile timer: no timers
 GET /t
 --- response_body
 true true true true
+--- no_error_log
+[error]
+
+
+
+=== TEST 9: the timer runs every 0.1 s
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local interval
+            ngx.timer.every = function(delay)
+                interval = delay
+                return true
+            end
+            new_checker()
+            ngx.say(tostring(interval))
+        }
+    }
+--- request
+GET /t
+--- response_body
+0.1
+--- no_error_log
+[error]
+
+
+
+=== TEST 10: an event of the checker that has the same name in another shm is not applied
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            local shm = ngx.shared.test_shm
+            local a, b = new_checker(), new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(a:add_target(ip, 22222, nil, true))
+            assert(a:add_target(ip, 33333, nil, true))
+            flush_events()
+            assert(#a.targets == 3 and #b.targets == 3)
+            local c = new_checker("testing", "other_shm")
+            assert(c:add_target(ip, 11111, nil, true))
+            assert(wait_until(function() return status(c, 11111) == "true" end))
+            assert(a:set_target_status(ip, 11111, nil, false))
+            assert(wait_until(function()
+                return status(a, 11111) == "false" and status(b, 11111) == "false"
+            end))
+            ngx.sleep(0.3)
+            ngx.say("a=", status(a, 11111), " b=", status(b, 11111), " c=", status(c, 11111))
+        }
+    }
+--- request
+GET /t
+--- response_body
+a=false b=false c=true
+--- no_error_log
+[error]
+
+
+
+=== TEST 11: a checker whose targets are not loaded yet takes an event and a run of the timer without an error
+--- http_config eval: $::HttpConfig
+--- config
+    location = /locked {
+        content_by_lua_block {
+            -- the target list is locked for 0.6 s
+            local lock = assert(require("resty.lock"):new("test_shm", { exptime = 0.6, timeout = 0 }))
+            assert(lock:lock(package.loaded.list_lock_key))
+            package.loaded.list_lock = lock
+            ngx.say("locked")
+        }
+        log_by_lua_block {
+            -- this phase cannot yield and the list is locked: new() leaves
+            -- the load of the targets to a timer
+            package.loaded.deferred = new_checker()
+        }
+    }
+    location = /t {
+        content_by_lua_block {
+            local a = new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(wait_until(function() return status(a, 11111) == "true" end))
+            package.loaded.list_lock_key = a.TARGET_LIST_LOCK
+
+            local sock = ngx.socket.tcp()
+            assert(sock:connect("127.0.0.1", ngx.var.server_port))
+            assert(sock:send("GET /locked HTTP/1.0\r\nHost: localhost\r\n\r\n"))
+            assert(sock:receive("*a"))
+            sock:close()
+            assert(wait_until(function() return package.loaded.deferred end))
+            local c = package.loaded.deferred
+            local loaded = c.targets ~= nil
+
+            -- an event for it, and runs of the timer, before its targets are loaded
+            assert(a:set_target_status(ip, 11111, nil, false))
+            ngx.sleep(0.25)
+            local still = c.targets ~= nil
+            local ok = wait_until(function()
+                return c.targets ~= nil and status(c, 11111) == "false"
+            end, 3)
+            ngx.say("loaded=", tostring(loaded), ",", tostring(still), " then ", tostring(ok))
+        }
+    }
+--- request
+GET /t
+--- response_body
+loaded=false,false then true
 --- no_error_log
 [error]

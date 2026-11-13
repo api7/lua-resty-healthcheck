@@ -19,6 +19,8 @@
 --                          full comparison of every checker)
 --           status         a target changes state and the event is delivered
 --           missed         a target changes state and the event is lost
+--           late           a target changes state and the event arrives
+--                          after the pass of the timers that is measured
 --           remove         TARGETS targets are removed one by one, each event
 --                          delivered
 --           remove-missed  half of the TARGETS targets are removed and the
@@ -260,7 +262,7 @@ elseif scenario == "idle" then
   report("  the same in CPU time", cpu_slices)
   report_stats(before)
 
-elseif scenario == "status" or scenario == "missed" then
+elseif scenario == "status" or scenario == "missed" or scenario == "late" then
   local a, b = {}, {}
   for c = 1, n_checkers do
     populate(scenario .. "-" .. c, n_targets)
@@ -274,11 +276,16 @@ elseif scenario == "status" or scenario == "missed" then
     healthy = not healthy
     local c = (r - 1) % n_checkers + 1
     assert(a[c]:set_target_status(addr(1), 8080, nil, healthy))
-    event_times[r] = deliver(b[c].ev_callback, scenario == "missed")
+    if scenario ~= "late" then
+      event_times[r] = deliver(b[c].ev_callback, scenario == "missed")
+    end
     reset_slices()
     -- one pass of the timers puts the copy right, unless nothing does
     tick_times[r], reconcile_times[r] = tick()
     slices[r], cpu_slices[r] = close_slice()
+    if scenario == "late" then
+      event_times[r] = deliver(b[c].ev_callback)
+    end
     if b[c]:get_target_status(addr(1), 8080) ~= healthy then
       wrong = wrong + 1
       -- put the copies right for the next round
@@ -286,7 +293,7 @@ elseif scenario == "status" or scenario == "missed" then
       a[c]:event_handler(healthy and "healthy" or "unhealthy", addr(1), 8080, addr(1))
     end
   end
-  if scenario == "status" then
+  if scenario ~= "missed" then
     report("event callback of the receiving checker", event_times)
   end
   report("one pass of the timers after the change", tick_times)

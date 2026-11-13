@@ -819,6 +819,9 @@ function checker:clear()
       self.status_ver = self.status_ver + 1
     end
     self.targets = {}
+    -- the members of the copy changed without an event: they are compared
+    -- with the list next time, even if the list is the one last compared
+    self.membership_changed = true
 
     -- raise event for our removed target
     self:raise_event(self.events.clear)
@@ -1702,6 +1705,10 @@ local SYNC_COST_LISTED = 3     -- a listed target, in a comparison of the member
 local SYNC_COST_CHECKER = 2    -- a checker: its version and its list are read
 local MAX_QUEUED_EVENTS = 1000
 local MAX_AHEAD = 128
+-- an event this far behind the version of the copy is not a late one
+local STALE_VERSION_GAP = 1000
+-- a comparison that keeps failing is logged this often
+local SYNC_ERROR_LOG_INTERVAL = 60
 local SHM_VERSION_KEY = SHM_PREFIX .. ":shm_version"
 local WEAK_KEYS = { __mode = "k" }
 
@@ -1853,6 +1860,12 @@ end
 
 -- Handles an event of a checker.
 local function on_event(self, event, data)
+  if data.shm and data.shm ~= self.shm_name then
+    -- from the checker that has this name in another shm: the source of an
+    -- event only has the name
+    return
+  end
+
   if self.syncing then
     -- applied when the comparison with shm is done
     local queue = self.event_queue
@@ -1881,7 +1894,13 @@ local function on_event(self, event, data)
     local applied = self.version_applied
     if applied then
       if version <= applied then
-        -- a comparison with shm already covered this change
+        -- a comparison with shm already covered this change. An event that
+        -- is far behind is not a late one: the version key was made again
+        -- from an earlier time (evicted, and the clock set back), so what
+        -- this worker counted means nothing, and the checker is compared.
+        if applied - version > STALE_VERSION_GAP then
+          resync_pending[self] = true
+        end
         return
       end
       if version == applied + 1 then
@@ -2170,9 +2189,15 @@ local function run_reconcile()
       if version ~= expected then
         local missed = true
         if version and expected and version > expected then
-          -- the shm is ahead: the events may be on their way
-          ngx_sleep(EVENT_GRACE)
+          -- the shm is ahead: the events may be on their way. With
+          -- lua-resty-worker-events they wait in its shm for the next poll:
+          -- they are dispatched now.
+          pcall(worker_events.poll)
           expected = tracker.expected
+          if not (expected and expected >= version) then
+            ngx_sleep(EVENT_GRACE)
+            expected = tracker.expected
+          end
           missed = not (expected and expected >= version)
         end
         -- (otherwise the version key was evicted from a full shm, and maybe
@@ -2210,11 +2235,22 @@ local function run_reconcile()
         local checker_obj = list[i]
         list[i] = false
         if not checker_obj.stopped then
-          local ok, err = sync_from_shm(checker_obj, budget)
+          -- an error is kept from ending the run: the other checkers are
+          -- still compared
+          local pok, ok, err = pcall(sync_from_shm, checker_obj, budget)
+          if not pok then
+            ok, err = nil, ok
+          end
           if ok == nil then
             -- tried again on the next run of the timer
             resync_pending[checker_obj] = true
-            checker_obj:log(ERR, "failed to reconcile targets with shm: ", err)
+            local now = ngx_now()
+            local last = checker_obj.sync_error_logged
+            if not last or now < last or now - last >= SYNC_ERROR_LOG_INTERVAL then
+              checker_obj.sync_error_logged = now
+              checker_obj:log(ERR, "failed to reconcile targets with shm (it is tried ",
+                                   "again on every run of the timer): ", err)
+            end
           end
           sync_spend(budget, SYNC_COST_CHECKER)
         end

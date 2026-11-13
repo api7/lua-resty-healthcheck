@@ -20,6 +20,21 @@ also reports the longest stretch a callback ran without yielding.
 The scenarios are listed at the top of the script. `resty` and
 lua-resty-timer have to be installed; the events library is not needed.
 
+`status`, `missed` and `late` create two checkers for each name (the one that
+makes the change and the one that is measured), so `CHECKERS=10000` there is
+20,000 checkers in the worker. `clear` and `remove-missed` create two as well,
+whatever `CHECKERS` is. The settings behind the figures quoted in the pull
+request, as `SCENARIO TARGETS CHECKERS ROUNDS`:
+
+    clear          10000 1     21        clear          18000 1     21
+    remove         2000  1     5
+    idle           2     10000 200       idle           10    1000  200
+    idle           10000 1     200
+    status         2     10000 100       status         10000 1     100
+    missed         2     10000 30        missed         10000 1     30
+    late           2     10000 30        late           10000 1     30
+    remove-missed  10000 1     21        remove-missed  18000 1     21
+
 ## Requests through Apache APISIX
 
 `apisix/run.sh` starts Apache APISIX in a container with a given copy of the

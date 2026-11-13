@@ -404,7 +404,7 @@ false,true compared=1 true,true
             local healthcheck = require("resty.healthcheck")
             healthcheck._set_sync_batch(10)
             local a = new_checker()
-            for port = 20001, 20040 do
+            for port = 20001, 20080 do
                 assert(a:add_target(ip, port, nil, true))
             end
             flush_events()
@@ -413,8 +413,10 @@ false,true compared=1 true,true
             end)
             local before = stats()
             healthcheck._reconcile()
-            local first = since(before, "yields")
-            ngx.say("members=", since(before, "members"), " yields>=10=", tostring(first >= 10),
+            -- with 10 units between two yields: 1 for the look at the
+            -- checker, 80 for decoding the list, 3 for each of the 80 listed
+            -- targets, 10 for the pass that removes targets, 2 for the checker
+            ngx.say("members=", since(before, "members"), " yields=", since(before, "yields"),
                     " ", status(a, 20001))
 
             lose_events(function()
@@ -422,16 +424,17 @@ false,true compared=1 true,true
             end)
             before = stats()
             healthcheck._reconcile()
-            local second = since(before, "yields")
-            ngx.say("members=", since(before, "members"), " yields=4..8=",
-                    tostring(second >= 4 and second <= 8), " ", status(a, 20001))
+            -- 1 for the look at the checker, 1 for each of the 80 statuses, 2
+            -- for the checker
+            ngx.say("members=", since(before, "members"), " yields=", since(before, "yields"),
+                    " ", status(a, 20001))
         }
     }
 --- request
 GET /t
 --- response_body
-members=1 yields>=10=true false
-members=0 yields=4..8=true true
+members=1 yields=22 false
+members=0 yields=8 true
 --- no_error_log
 [error]
 
