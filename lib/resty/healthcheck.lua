@@ -1806,7 +1806,9 @@ function _M.new(opts)
               if #removed_targets > 0 then
                 target_list = serialize(target_list)
 
-                local ok, err = shm:set(checker_obj.TARGET_LIST, target_list)
+                -- each checker has its own shm: `shm` above is the one of the
+                -- checker that started this timer
+                local ok, err = checker_obj.shm:set(checker_obj.TARGET_LIST, target_list)
                 if not ok then
                   return nil, "failed to store target_list in shm: " .. err
                 end
