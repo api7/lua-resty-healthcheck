@@ -1688,7 +1688,7 @@ function _M.new(opts)
   self.EVENT_SOURCE     = EVENT_SOURCE_PREFIX .. " [" .. self.name .. "]"
   self.LOG_PREFIX       = LOG_PREFIX .. "(" .. self.name .. ") "
 
-  -- register for events, and directly after load initial target list
+  -- load the initial target list, and register for events directly after:
   -- order is important!
   do
     -- Lock the list, in case it is being cleared by another worker
@@ -1721,6 +1721,14 @@ function _M.new(opts)
       -- just a wrapper to be able to access `self` as a closure
       return self:event_handler(event, data.ip, data.port, data.hostname)
     end
+
+    -- Subscribe before polling. The events dispatched by that poll (with
+    -- lua-resty-events, the ones delivered while it sleeps) are about changes
+    -- made after the targets were loaded above; if the checker subscribes
+    -- only in start(), they are dropped for it and its copy stays wrong until
+    -- the same target changes again. start() unsubscribes and subscribes
+    -- again, so the checker stays subscribed once.
+    worker_events.register_weak(self.ev_callback, self.EVENT_SOURCE)
 
     -- handle events to sync up in case there was a change by another worker
     worker_events:poll()
