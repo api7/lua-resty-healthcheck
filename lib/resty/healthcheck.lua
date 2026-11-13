@@ -509,8 +509,6 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
         end
         target.purge_time = nil
         found = true
-        internal_health = self:get_target_status(ip, port, hostname) and
-                          "healthy" or "unhealthy"
         break
       end
     end
@@ -518,10 +516,35 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
     -- we first add the internal health, and only then the updated list.
     -- this prevents a state where a target is in the list, but does not
     -- have a key in the shm.
-    local ok, err = self.shm:set(key_for(self.TARGET_STATE, ip, port, hostname),
-                                 INTERNAL_STATES[internal_health])
+    -- A target re-added inside the purge window keeps the state it has in
+    -- shm: probes and reports write it under the target lock, so it must not
+    -- be overwritten here from this worker's copy, which may be older. Only a
+    -- missing state (evicted from a full shm) is filled in, with the status
+    -- this worker has for the target if it has one.
+    local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
+    local ok, err
+    local state_filled = false
+    if found then
+      local known = get_target(self, ip, port, hostname)
+      if known and known.internal_health then
+        internal_health = known.internal_health
+      end
+      ok, err = self.shm:add(state_key, INTERNAL_STATES[internal_health])
+      if ok then
+        state_filled = true
+      elseif err == "exists" then
+        ok, err = true, nil
+      end
+    else
+      -- a new target counts from zero: a report made for it after an earlier
+      -- removal, by a worker whose copy still had it, can have left a counter
+      self.shm:delete(key_for(self.TARGET_COUNTER, ip, port, hostname))
+      ok, err = self.shm:set(state_key, INTERNAL_STATES[internal_health])
+    end
     if not ok then
-      self:log(ERR, "failed to set initial health status in shm: ", err)
+      -- a checker created later would load a listed target without a state
+      -- as having no status: do not publish it
+      return nil, "failed to set initial health status in shm: " .. err
     end
 
     -- target does not exist, go add it
@@ -538,11 +561,15 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
 
     ok, err = self.shm:set(self.TARGET_LIST, target_list)
     if not ok then
+      if not found then
+        -- leave no state behind for a target that is not listed
+        self.shm:delete(state_key)
+      end
       return nil, "failed to store target_list in shm: " .. err
     end
 
-    -- raise event for our newly added target
-    if not found then
+    -- raise event for our newly added target, or for the state filled in
+    if not found or state_filled then
       self:raise_event(self.events[internal_health], ip, port, hostname)
     end
 
@@ -735,6 +762,65 @@ local function ctr_get(multictr, idx)
 end
 
 
+-- Tells whether a target is in the target list in shm, which decides
+-- membership. Every change writes the list, so a missing list was evicted
+-- from a full shm: membership is then unknown.
+-- @return `"listed"`, `"unlisted"` or `"unknown"`, or `nil + error`.
+local function target_membership(self, ip, port, hostname)
+  local raw, err = self.shm:get(self.TARGET_LIST)
+  if err then
+    return nil, "failed to fetch target_list from shm: " .. err
+  end
+  if raw == nil then
+    return "unknown"
+  end
+  for _, target in ipairs(deserialize(raw)) do
+    if target.ip == ip and target.port == port
+       and (target.hostname or target.ip) == hostname
+    then
+      return "listed"
+    end
+  end
+  return "unlisted"
+end
+
+
+-- Writes the state of an existing target. A target that another worker
+-- removed meanwhile gets no state written: this worker's copy still has it,
+-- but a state written for it, and the event that follows, would bring it back
+-- in the workers that already removed it.
+-- @return `true` when written, `false` when the target was removed, or
+-- `nil + error`.
+local function write_target_state(self, ip, port, hostname, state)
+  local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
+  local ok, err = self.shm:replace(state_key, INTERNAL_STATES[state])
+  if ok then
+    return true
+  end
+  if err ~= "not found" then
+    return nil, err
+  end
+
+  -- no state: the target was removed, or its state key was evicted from a
+  -- full shm while it is still listed, and then it is written again. It is
+  -- also written when the list itself was evicted and nothing tells whether
+  -- the target is listed, as before, so that health changes keep working.
+  local membership, list_err = target_membership(self, ip, port, hostname)
+  if not membership then
+    return nil, list_err
+  end
+  if membership == "unlisted" then
+    return false
+  end
+
+  ok, err = self.shm:set(state_key, INTERNAL_STATES[state])
+  if not ok then
+    return nil, err
+  end
+  return true
+end
+
+
 -- Increment the healthy or unhealthy counter. If the threshold of occurrences
 -- is reached, it changes the status of the target in the shm and posts an
 -- event.
@@ -805,9 +891,25 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
     end
 
     if new_health and new_health ~= current_health then
-      local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
-      self.shm:set(state_key, INTERNAL_STATES[new_health])
+      local written, write_err = write_target_state(self, ip, port, hostname, new_health)
+      if written == false then
+        -- removed meanwhile by another worker: nothing is left to count
+        self.shm:delete(counter_key)
+        self:log(DEBUG, "not changing the state of a target that was removed: ",
+                        hostname, " ", ip, ":", port)
+        return true
+      end
+
+      if written == nil then
+        -- e.g. the shm is full. The other workers are told anyway, as they
+        -- were before: the target did reach its threshold.
+        self:log(ERR, "failed to write state '", new_health, "' of ", hostname,
+                      " ", ip, ":", port, " to shm: ", write_err)
+      end
       self:raise_event(self.events[new_health], ip, port, hostname)
+      if written == nil then
+        return nil, write_err
+      end
     end
 
     return true
@@ -991,29 +1093,40 @@ function checker:set_target_status(ip, port, hostname, is_healthy)
   end
 
   local counter_key = key_for(self.TARGET_COUNTER, ip, port, hostname)
-  local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
 
   local ok, err = locking_target(self, ip, port, hostname, function()
 
-    local _, err = self.shm:set(counter_key, 0)
-    if err then
-      return nil, err
+    local written, write_err = write_target_state(self, ip, port, hostname, health_report)
+    if written == false then
+      -- removed meanwhile by another worker
+      self:log(DEBUG, "not setting the status of a target that was removed: ",
+                      hostname, " ", ip, ":", port)
+      return true
     end
 
-    self.shm:set(state_key, INTERNAL_STATES[health_report])
-    if err then
-      return nil, err
+    if written == nil then
+      -- e.g. the shm is full. The other workers are told anyway, as they
+      -- were before.
+      self:log(ERR, "failed to write state '", health_report, "' of ", hostname,
+                    " ", ip, ":", port, " to shm: ", write_err)
     end
 
+    -- announce the change before anything else can fail
     self:raise_event(self.events[health_report], ip, port, hostname)
+    self:log(WARN, health_report, " forced for ", hostname, " ", ip, ":", port)
+
+    local _, err = self.shm:set(counter_key, 0)
+    if written == nil then
+      return nil, write_err
+    end
+    if err then
+      return nil, err
+    end
 
     return true
 
   end)
 
-  if ok then
-    self:log(WARN, health_report, " forced for ", hostname, " ", ip, ":", port)
-  end
   return ok, err
 end
 
