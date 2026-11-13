@@ -72,6 +72,9 @@ __DATA__
 --- config
     location = /t {
         content_by_lua_block {
+            -- the reconcile timer would correct the copy of `b` as well:
+            -- without it, only the event does
+            ngx.timer.every = function() return true end
             local we = require "resty.events.compat"
             local a = new_checker()
             assert(a:add_target("127.0.0.1", 11111, nil, true))

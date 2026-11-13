@@ -24,6 +24,9 @@ __DATA__
         content_by_lua_block {
             local we = require "resty.worker.events"
             assert(we.configure{ shm = "my_worker_events", interval = 0.1 })
+            -- the reconcile timer would correct the copy of `b` as well:
+            -- without it, only the event does
+            ngx.timer.every = function() return true end
             local healthcheck = require("resty.healthcheck")
             local opts = {
                 name = "testing",

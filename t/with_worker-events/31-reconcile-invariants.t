@@ -573,6 +573,9 @@ scans=1 compared=1 yields=4 false
             end)
             local methods = getmetatable(shm).__index
             local writes, saved = {}, {}
+            -- the timers of the library and of the events module write to
+            -- their shm too: only what this request does is noted
+            local this_request = coroutine.running()
             for _, name in ipairs({ "set", "safe_set", "add", "safe_add", "replace", "incr", "delete",
                                     "flush_all", "flush_expired", "lpush", "rpush", "lpop", "rpop",
                                     "expire" }) do
@@ -580,7 +583,9 @@ scans=1 compared=1 yields=4 false
                 if method then
                     saved[name] = method
                     methods[name] = function(dict, key, ...)
-                        writes[#writes + 1] = name .. " " .. tostring(key)
+                        if coroutine.running() == this_request then
+                            writes[#writes + 1] = name .. " " .. tostring(key)
+                        end
                         return method(dict, key, ...)
                     end
                 end

@@ -13,6 +13,10 @@ our $HttpConfig = qq{
     lua_shared_dict my_worker_events 8m;
 
     init_by_lua_block {
+        -- A checker that stands for a worker which missed an event has to
+        -- keep the copy it has: the reconcile timer is not started.
+        ngx.timer.every = function() return true end
+
         ip = "127.0.0.1"
 
         -- polls cond() until it returns true or the timeout (2 s) expires
