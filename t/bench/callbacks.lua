@@ -15,8 +15,11 @@
 -- SCENARIO  clear          a checker with TARGETS targets receives `clear`
 --           idle           the timers of a worker with CHECKERS checkers of
 --                          TARGETS targets each, when nothing changes, over
---                          ROUNDS passes (100 passes include the periodic
---                          full comparison of every checker)
+--                          ROUNDS passes. Every checker was compared with shm
+--                          once before; the background comparison goes on in
+--                          the measured passes, a few checkers in each, and
+--                          the last line of the output tells how many it
+--                          compared (compared=)
 --           status         a target changes state and the event is delivered
 --           missed         a target changes state and the event is lost
 --           late           a target changes state and the event arrives
@@ -211,16 +214,54 @@ local function stats()
   return copy
 end
 
-local function report_stats(before)
+local STAT_NAMES = { "runs", "scans", "compared", "members", "corrected", "yields", "queued" }
+
+-- what the counters gained since `before`, added to `sum` when one is given
+local function gained(before, sum)
   local after = stats()
   if not (before and after) then
+    return sum
+  end
+  sum = sum or {}
+  for _, k in ipairs(STAT_NAMES) do
+    sum[k] = (sum[k] or 0) + after[k] - before[k]
+  end
+  return sum
+end
+
+local function report_stats(sum)
+  if not sum then
     return
   end
   local parts = {}
-  for _, k in ipairs({ "runs", "scans", "compared", "members", "corrected", "yields", "queued" }) do
-    parts[#parts + 1] = k .. "=" .. (after[k] - before[k])
+  for _, k in ipairs(STAT_NAMES) do
+    parts[#parts + 1] = k .. "=" .. sum[k]
   end
   print("  reconciliation while measured: " .. table.concat(parts, " "))
+end
+
+-- Passes of the timers before anything is measured, so that the first
+-- comparison of a checker with shm, which also decodes its list, is not part
+-- of it. The background comparison takes the checkers in turn, a few in each
+-- pass: the passes go on until the counters show that each of the `count`
+-- checkers was compared once, which has to happen within WARM_UP_LIMIT_MS. A
+-- library without the counters gets WARM_UP_PASSES passes.
+local WARM_UP_PASSES = 110
+local WARM_UP_LIMIT_MS = 300 * 1000
+local function warm_up(count)
+  local before = stats()
+  if not before then
+    for _ = 1, WARM_UP_PASSES do tick() end
+    return
+  end
+  local started = now_ms()
+  repeat
+    tick()
+    local compared = stats().compared - before.compared
+    if compared < count and now_ms() - started > WARM_UP_LIMIT_MS then
+      error("the warm-up did not end: " .. compared .. " of " .. count .. " checkers compared")
+    end
+  until compared >= count
 end
 
 -- keep the purge of delayed_clear() targets out of the measurements: its
@@ -250,8 +291,7 @@ elseif scenario == "idle" then
     populate("idle-" .. c, n_targets)
     new_checker("idle-" .. c)
   end
-  -- the first full comparison of every checker is not what is measured
-  for _ = 1, 110 do tick() end
+  warm_up(n_checkers)
   local before = stats()
   local times, reconcile_times, slices, cpu_slices = {}, {}, {}, {}
   for r = 1, rounds do
@@ -263,7 +303,7 @@ elseif scenario == "idle" then
   report("  of which the reconcile timer", reconcile_times)
   report("longest stretch without a yield in a pass", slices)
   report("  the same in CPU time", cpu_slices)
-  report_stats(before)
+  report_stats(gained(before))
 
 elseif scenario == "status" or scenario == "missed" or scenario == "late" then
   local a, b = {}, {}
@@ -271,11 +311,11 @@ elseif scenario == "status" or scenario == "missed" or scenario == "late" then
     populate(scenario .. "-" .. c, n_targets)
     a[c], b[c] = new_checker(scenario .. "-" .. c), new_checker(scenario .. "-" .. c)
   end
-  for _ = 1, 110 do tick() end
+  warm_up(2 * n_checkers)
   local before = stats()
   local event_times, tick_times, reconcile_times, slices, cpu_slices = {}, {}, {}, {}, {}
   -- the status each checker was last given: every round changes one
-  local given, wrong = {}, 0
+  local given, wrong, wrong_after_event = {}, 0, 0
   for r = 1, rounds do
     local c = (r - 1) % n_checkers + 1
     local healthy = given[c] == false
@@ -288,11 +328,21 @@ elseif scenario == "status" or scenario == "missed" or scenario == "late" then
     -- one pass of the timers puts the copy right, unless nothing does
     tick_times[r], reconcile_times[r] = tick()
     slices[r], cpu_slices[r] = close_slice()
+    -- looked at before a late event is delivered: the event would put right
+    -- what the pass left wrong
+    local is_wrong = b[c]:get_target_status(addr(1), 8080) ~= healthy
+    if is_wrong then
+      wrong = wrong + 1
+    end
     if scenario == "late" then
       event_times[r] = deliver(b[c].ev_callback)
+      -- and the late event must not put an older status back
+      is_wrong = b[c]:get_target_status(addr(1), 8080) ~= healthy
+      if is_wrong then
+        wrong_after_event = wrong_after_event + 1
+      end
     end
-    if b[c]:get_target_status(addr(1), 8080) ~= healthy then
-      wrong = wrong + 1
+    if is_wrong then
       -- put the copies right for the next round
       b[c]:event_handler(healthy and "healthy" or "unhealthy", addr(1), 8080, addr(1))
       a[c]:event_handler(healthy and "healthy" or "unhealthy", addr(1), 8080, addr(1))
@@ -306,7 +356,10 @@ elseif scenario == "status" or scenario == "missed" or scenario == "late" then
   report("longest stretch without a yield in that pass", slices)
   report("  the same in CPU time", cpu_slices)
   print(string.format("  copy still wrong after the pass: %d of %d rounds", wrong, rounds))
-  report_stats(before)
+  if scenario == "late" then
+    print(string.format("  copy wrong after the late event: %d of %d rounds", wrong_after_event, rounds))
+  end
+  report_stats(gained(before))
 
 elseif scenario == "remove" then
   local totals, longest_calls = {}, {}
@@ -329,9 +382,10 @@ elseif scenario == "remove" then
   report("longest single event callback", longest_calls)
 
 elseif scenario == "remove-missed" then
-  local before = stats()
   local tick_times, slices, cpu_slices, yielded = {}, {}, {}, {}
   local wrong = 0
+  -- what the counters gained in the measured passes
+  local counted
   for r = 1, rounds do
     local name = "remove-missed-" .. r
     populate(name, n_targets)
@@ -352,10 +406,14 @@ elseif scenario == "remove-missed" then
     a:raise_event(a.events.remove, addr(1), 8080, addr(1))
     deliver(nil, true)
 
+    -- only this pass is counted, not the one that followed the creation of
+    -- the checkers
+    local before = stats()
     reset_slices()
     tick_times[r] = tick()
     slices[r], cpu_slices[r] = close_slice()
     yielded[r] = yields
+    counted = gained(before, counted)
     if #b.targets ~= #list then
       wrong = wrong + 1
     end
@@ -367,7 +425,7 @@ elseif scenario == "remove-missed" then
   report("  the same in CPU time", cpu_slices)
   report("yields in that pass (a count, not ms)", yielded)
   print(string.format("  copy still wrong after the pass: %d of %d rounds", wrong, rounds))
-  report_stats(before)
+  report_stats(counted)
 
 else
   error("unknown SCENARIO: " .. scenario)

@@ -1,13 +1,28 @@
 -- Loaded by APISIX through apisix.lua_module_hook. It counts the health check
 -- events each worker gets, and with LOSE_PERCENT set, that share of them
 -- reaches no callback in the worker that should get them: events lost in
--- transport.
+-- transport. It also counts the checkers each worker creates.
 -- gives access to the counters of the reconciliation, where the library has them
 rawset(_G, "__TESTING_HEALTHCHECKER", true)
 local we = require("resty.events.compat")
 local json = require("cjson.safe")
+local hc = require("resty.healthcheck")
 local lose = tonumber(os.getenv("LOSE_PERCENT") or "0") or 0
 local lost, seen = 0, 0
+-- APISIX creates the checker of an upstream in a timer, some time after the
+-- first request to it: load.lua waits until this says they are all there
+local checkers = 0
+
+do
+    local new = hc.new
+    hc.new = function(...)
+        local checker, err = new(...)
+        if checker then
+            checkers = checkers + 1
+        end
+        return checker, err
+    end
+end
 
 do
     local wrapped = setmetatable({}, { __mode = "k" })
@@ -54,8 +69,7 @@ end
 local _M = {}
 
 function _M.stats()
-    local out = { worker = ngx.worker.id(), events_seen = seen, events_lost = lost }
-    local hc = require("resty.healthcheck")
+    local out = { worker = ngx.worker.id(), checkers = checkers, events_seen = seen, events_lost = lost }
     if hc._reconcile_stats then
         out.reconcile = hc._reconcile_stats()
     end

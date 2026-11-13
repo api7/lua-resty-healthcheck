@@ -1,7 +1,8 @@
 -- Load generator, run by run.sh with `resty` inside the container.
 --   UPSTREAMS routes exist (/hello/<n>); every worker first serves each of
---   them once, so that it has a checker for each upstream; then CONNS
---   connections request the first HOT routes in turn for DURATION seconds.
+--   them once and is waited for until it has a checker for each upstream;
+--   then CONNS connections request the first HOT routes in turn for DURATION
+--   seconds.
 -- Prints one line of JSON: requests, requests per second, latency (ms, and
 -- the number of requests that took more than 5 and 10 ms), the
 -- CPU time of the nginx workers as a share of one core each, the health check
@@ -20,6 +21,8 @@ local conns = tonumber(os.getenv("CONNS") or "16")
 local hot = math.min(tonumber(os.getenv("HOT") or "20"), upstreams)
 local duration = tonumber(os.getenv("DURATION") or "15")
 local settle = tonumber(os.getenv("SETTLE") or "8")
+-- how long the workers get to create their checkers, in seconds
+local READY_TIMEOUT = 120
 
 local function connect()
     local c = http.new()
@@ -73,19 +76,41 @@ for w = 0, workers - 1 do
     end
     c:close()
 end
-ngx.sleep(settle)
 
+-- The counters of the hook in worker `w`. An answer that is not these
+-- counters ends the run: the totals would be wrong without that worker.
+local function worker_stats(w)
+    -- a new connection: the server closes one after a number of requests
+    local c = conn_to(w)
+    local status, body = get(c, "/hookstats")
+    c:close()
+    local stats = status == 200 and json.decode(body or "")
+    assert(type(stats) == "table" and stats.worker == w and type(stats.checkers) == "number"
+           and type(stats.events_seen) == "number" and type(stats.events_lost) == "number",
+           "/hookstats of worker " .. w .. ": " .. tostring(status) .. " " .. tostring(body))
+    return stats
+end
 local function hookstats()
     local out = {}
     for w = 0, workers - 1 do
-        -- a new connection: the server closes one after a number of requests
-        local c = conn_to(w)
-        local _, body = get(c, "/hookstats")
-        c:close()
-        out[#out + 1] = json.decode(body or "") or body
+        out[#out + 1] = worker_stats(w)
     end
     return out
 end
+
+-- APISIX creates the checkers in a timer, after the requests above were
+-- answered: nothing is measured before every worker has one for each upstream
+local ready_deadline = now_us() + READY_TIMEOUT * 1e6
+for w = 0, workers - 1 do
+    while true do
+        local checkers = worker_stats(w).checkers
+        if checkers >= upstreams then break end
+        assert(now_us() < ready_deadline, "worker " .. w .. " has " .. checkers .. " of " .. upstreams
+               .. " checkers after " .. READY_TIMEOUT .. " seconds")
+        ngx.sleep(0.5)
+    end
+end
+ngx.sleep(settle)
 
 local before = hookstats()
 local cpu0, nworkers = worker_cpu()
@@ -143,13 +168,11 @@ local out = {
 }
 local ev_seen, ev_lost, rec = 0, 0, {}
 for w = 1, #after do
-    if type(after[w]) == "table" and type(before[w]) == "table" then
-        ev_seen = ev_seen + after[w].events_seen - before[w].events_seen
-        ev_lost = ev_lost + after[w].events_lost - before[w].events_lost
-        if after[w].reconcile and before[w].reconcile then
-            for k, v in pairs(after[w].reconcile) do
-                rec[k] = (rec[k] or 0) + v - before[w].reconcile[k]
-            end
+    ev_seen = ev_seen + after[w].events_seen - before[w].events_seen
+    ev_lost = ev_lost + after[w].events_lost - before[w].events_lost
+    if after[w].reconcile and before[w].reconcile then
+        for k, v in pairs(after[w].reconcile) do
+            rec[k] = (rec[k] or 0) + v - before[w].reconcile[k]
         end
     end
 end

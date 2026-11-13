@@ -3,6 +3,9 @@
 import sys
 K, M, F = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
 INTERVAL = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+# node n of upstream i is 127.<1 + n>.<i >> 8>.<i & 255>: no part may go over 255
+if not (1 <= K <= 65535 and 1 <= M <= 255):
+    sys.exit(f"gen_conf.py: {K} upstreams of {M} nodes: there can be 1 to 65535 upstreams, of 1 to 255 nodes each")
 out = ["routes:"]
 def fn_route(rid, uri, code):
     out.extend([f"  - id: {rid}", f"    uri: {uri}", "    plugins:", "      serverless-pre-function:", "        phase: access", "        functions:", f'          - "{code}"'])

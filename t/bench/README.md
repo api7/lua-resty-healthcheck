@@ -20,6 +20,14 @@ also reports the longest stretch a callback ran without yielding.
 The scenarios are listed at the top of the script. `resty` and
 lua-resty-timer have to be installed; the events library is not needed.
 
+`idle`, `status`, `missed` and `late` first run the timers until every checker
+was compared with shm once (110 passes with a version of the library that does
+not compare), so the first comparison of a checker, which also decodes its
+list, is not in the figures. The background comparison goes on after that, a
+few checkers in each pass: with many checkers or targets the passes of `idle`
+cover a part of a round of it, and the `compared=` counter in the last line of
+the output tells how many checkers that was.
+
 `status`, `missed` and `late` create two checkers for each name (the one that
 makes the change and the one that is measured), so `CHECKERS=10000` there is
 20,000 checkers in the worker. `clear` and `remove-missed` create two as well,
