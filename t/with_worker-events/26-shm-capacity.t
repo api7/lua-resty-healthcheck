@@ -111,6 +111,8 @@ qr/\[error\].*\[healthcheck\] shm 'small_shm' is full: a target list \('lua-rest
             end
             healthcheck._set_shm_report_interval(0)
             checker.shm:set(key, too_large)
+            -- the count starts again after a report
+            checker.shm:set(key, too_large)
             ngx.say("done")
         }
     }
@@ -121,10 +123,11 @@ done
 --- error_log
 increase the size of this lua_shared_dict (4 more report(s) like this were skipped since the last one)
 --- grep_error_log eval
-qr/shm 'small_shm' is full: the state of a target|increase the size of this lua_shared_dict(?: \(\d+ more report\(s\) like this were skipped since the last one\))?/
+qr/increase the size of this lua_shared_dict[^,]*/
 --- grep_error_log_out
-shm 'small_shm' is full: the state of a target
-shm 'small_shm' is full: the state of a target
+increase the size of this lua_shared_dict
+increase the size of this lua_shared_dict (4 more report(s) like this were skipped since the last one)
+increase the size of this lua_shared_dict
 
 
 
@@ -237,6 +240,9 @@ qr/\A\[warn\] [^\n]*shm 'small_shm' is full: storing\n\[error\] [^\n]*shm 'small
             fill(raw)
             local ok, err, forcible = shm:add(state_key, string.rep("x", 64))
             ngx.say("add: ", tostring(ok), " ", tostring(err), " ", tostring(forcible))
+            -- a key that is not a string, in a write that evicts entries
+            local pok, _, _, evicted = pcall(shm.set, shm, 456, string.rep("x", 64))
+            ngx.say("number key, evicting: ", tostring(pok), " ", tostring(evicted))
             local n
             n, err, forcible = shm:incr(counter_key, 256, 0)
             ngx.say("incr: ", tostring(n), " ", tostring(err), " ", tostring(forcible))
@@ -257,15 +263,17 @@ qr/\A\[warn\] [^\n]*shm 'small_shm' is full: storing\n\[error\] [^\n]*shm 'small
 GET /t
 --- response_body
 add: true nil true
+number key, evicting: true true
 incr: 256 nil true
 values: 1 1 3 3
 replace: false no memory
 number key: true
 passed through: true number nil
 --- grep_error_log eval
-qr/shm 'small_shm' is full: [a-z ]+ \('(?:lua-resty-healthcheck:testing:[a-z]+:[a-z]{5}|123)[^']*'\) (?:evicted other entries|could not be stored)/
+qr/shm 'small_shm' is full: [a-z ]+ \('(?:lua-resty-healthcheck:testing:[a-z]+:[a-z]{5}|123|456)[^']*'\) (?:evicted other entries|could not be stored)/
 --- grep_error_log_out eval
 "shm 'small_shm' is full: storing the state of a target ('lua-resty-healthcheck:testing:state:added') evicted other entries
+shm 'small_shm' is full: storing a key ('456') evicted other entries
 shm 'small_shm' is full: storing the counter of a target ('lua-resty-healthcheck:testing:counter:" . ("c" x 64) . "') evicted other entries
 shm 'small_shm' is full: the state of a target ('lua-resty-healthcheck:testing:state:added') could not be stored
 shm 'small_shm' is full: a key ('123') could not be stored
@@ -307,8 +315,13 @@ shm 'test_shm' is full: the state of a target
             local checker = new_checker("test_shm")
             ngx.say(#healthcheck.get_target_list("nosuch", "test_shm"))
             assert(checker:add_target(ip, 11111, nil, true))
-            ngx.shared.test_shm:delete(checker.TARGET_LIST)
+            local raw = ngx.shared.test_shm
+            local list = assert(raw:get(checker.TARGET_LIST))
+            raw:delete(checker.TARGET_LIST)
             ngx.say(#healthcheck.get_target_list("testing", "test_shm"))
+            -- put back before this handler yields: the periodic cleanup of
+            -- the checker would report the missing list, as it should
+            assert(raw:set(checker.TARGET_LIST, list))
         }
     }
 --- request
@@ -316,6 +329,7 @@ GET /t
 --- response_body
 0
 0
+--- wait: 0.5
 --- no_error_log eval
 qr/\[healthcheck\] shm '/
 
@@ -336,6 +350,9 @@ qr/\[healthcheck\] shm '/
             checker.shm:set(key, too_large)   -- inside the interval: skipped
             offset = -3600
             checker.shm:set(key, too_large)   -- an hour earlier: reported
+            checker.shm:set(key, too_large)   -- the interval starts again from there: skipped
+            offset = -3600 + 61
+            checker.shm:set(key, too_large)   -- reported, with the one skipped
             ngx.now = real_now
             ngx.say("done")
         }
@@ -345,7 +362,58 @@ GET /t
 --- response_body
 done
 --- grep_error_log eval
-qr/shm 'small_shm' is full: the state of a target/
+qr/shm 'small_shm' is full: the state of a target|increase the size of this lua_shared_dict \(\d+ more[^,]*/
 --- grep_error_log_out
 shm 'small_shm' is full: the state of a target
 shm 'small_shm' is full: the state of a target
+shm 'small_shm' is full: the state of a target
+
+
+
+=== TEST 11: the report of a failed write says whether other entries were evicted
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local healthcheck = require("resty.healthcheck")
+            healthcheck._set_shm_report_interval(0)
+            local checker = new_checker("small_shm")
+            local raw = ngx.shared.small_shm
+            local key = checker.TARGET_STATE .. ":a"
+            local too_large = string.rep("x", 100000)
+            -- nothing to evict
+            raw:flush_all()
+            raw:flush_expired()
+            local ok, err, forcible = checker.shm:set(key, too_large)
+            ngx.say(tostring(ok), " ", err, " ", tostring(forcible))
+            -- entries to evict
+            fill(raw)
+            ok, err, forcible = checker.shm:set(key, too_large)
+            ngx.say(tostring(ok), " ", err, " ", tostring(forcible))
+            -- incr() does not say whether it evicted entries when it fails
+            raw:flush_all()
+            raw:flush_expired()
+            local n = 0
+            repeat
+                n = n + 1
+                ok, err, forcible = raw:set("f" .. n, true)
+                assert(ok, err)
+            until forcible
+            local keys = #raw:get_keys(0)
+            ngx.say(select("#", checker.shm:incr(checker.TARGET_COUNTER .. ":" .. string.rep("c", 300), 1, 0)),
+                    " ", keys - #raw:get_keys(0))
+        }
+    }
+--- request
+GET /t
+--- response_body
+false no memory false
+false no memory true
+2 30
+--- grep_error_log eval
+qr/shm 'small_shm' is full: [a-z ]+ \('lua-resty-healthcheck:testing:[a-z]+:[ac]'?[^.]*\./
+--- grep_error_log_out eval
+"shm 'small_shm' is full: the state of a target ('lua-resty-healthcheck:testing:state:a') could not be stored, and the value it had before, if any, is gone.
+shm 'small_shm' is full: the state of a target ('lua-resty-healthcheck:testing:state:a') could not be stored, other entries were evicted trying, and the value it had before, if any, is gone.
+shm 'small_shm' is full: the counter of a target ('lua-resty-healthcheck:testing:counter:" . ("c" x 300) . "') could not be stored, other entries may have been evicted trying, and the value it had before, if any, is gone.
+"

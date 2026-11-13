@@ -100,7 +100,9 @@ All checkers that use the same `shm_name` keep their data in that
 `lua_shared_dict`. Apache APISIX uses one dictionary for all its checkers:
 `upstream-healthcheck`, 10m by default, set under
 `nginx_config.meta.lua_shared_dict` in its `config.yaml` (APISIX 3.16 and
-later; `nginx_config.http.lua_shared_dict` before).
+later; before that, `upstream-healthcheck` under
+`nginx_config.http.lua_shared_dict` and `upstream-healthcheck-stream` under
+`nginx_config.stream.lua_shared_dict`).
 
 What is stored:
 
@@ -123,8 +125,9 @@ the key had before was removed: an `add_target()` that fails this way leaves
 its checker without a target list in the shm. This library logs it when one
 of its writes evicts entries (a warning) or fails (an error), both as `shm
 '<name>' is full: ...`, and when a checker finds that its target list is gone
-(an error, `shm '<name>' no longer has the target list of checker ...`), each
-at most once a minute for each shm in each worker.
+(an error, `shm '<name>' no longer has the target list of checker ...`): at
+most one warning and one error a minute for each shm in each worker, so a
+failed write and a lost target list share the error.
 
 How many targets fit depends on how they are spread over the checkers,
 because the target list of a checker is one value: it needs a run of
