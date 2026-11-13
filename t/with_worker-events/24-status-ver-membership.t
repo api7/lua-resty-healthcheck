@@ -57,7 +57,7 @@ run_tests();
 
 __DATA__
 
-=== TEST 1: a target first seen as unhealthy bumps status_ver (unknown, which callers treat as usable, to unhealthy)
+=== TEST 1: a target first seen as unhealthy bumps status_ver once (unknown, which callers treat as usable, to unhealthy)
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -66,19 +66,19 @@ __DATA__
             local ver = b.status_ver
             assert(a:add_target("127.0.0.1", 11111, nil, false))
             wait_until(function() return status(b, 11111) == "false" end)
-            ngx.say(status(b, 11111), " ", b.status_ver > ver)
+            ngx.say(status(b, 11111), " ", b.status_ver - ver)
         }
     }
 --- request
 GET /t
 --- response_body
-false true
+false 1
 --- no_error_log
 [error]
 
 
 
-=== TEST 2: removing an unhealthy target bumps status_ver (unhealthy to unknown)
+=== TEST 2: removing an unhealthy target bumps status_ver once (unhealthy to unknown)
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -90,19 +90,19 @@ false true
             -- remove_target() does not default the hostname to the ip
             assert(a:remove_target("127.0.0.1", 11111, "127.0.0.1"))
             wait_until(function() return status(b, 11111) == "nil/target not found" end)
-            ngx.say(status(b, 11111), " ", b.status_ver > ver)
+            ngx.say(status(b, 11111), " ", b.status_ver - ver)
         }
     }
 --- request
 GET /t
 --- response_body
-nil/target not found true
+nil/target not found 1
 --- no_error_log
 [error]
 
 
 
-=== TEST 3: clear() bumps status_ver in the worker that calls it, at once, and in the others
+=== TEST 3: clear() bumps status_ver once in the worker that calls it, at once, and once in the others
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -115,21 +115,21 @@ nil/target not found true
             local ver_a, ver_b = a.status_ver, b.status_ver
             assert(a:clear())
             -- the caller's copy is emptied by clear() itself
-            local at_once = status(a, 11111) .. " " .. tostring(a.status_ver > ver_a)
+            local at_once = status(a, 11111) .. " " .. (a.status_ver - ver_a)
             wait_until(function() return status(b, 11111) == "nil/target not found" end)
-            ngx.say(at_once, " | ", status(b, 11111), " ", b.status_ver > ver_b)
+            ngx.say(at_once, " | ", status(b, 11111), " ", b.status_ver - ver_b, " | ", a.status_ver - ver_a)
         }
     }
 --- request
 GET /t
 --- response_body
-nil/target not found true | nil/target not found true
+nil/target not found 1 | nil/target not found 1 | 1
 --- no_error_log
 [error]
 
 
 
-=== TEST 4: clear() on a checker without targets does not bump status_ver
+=== TEST 4: clear() on a checker without targets, and a remove for a target it does not have, do not bump status_ver
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -139,6 +139,7 @@ nil/target not found true | nil/target not found true
             local ver_a, ver_b = a.status_ver, b.status_ver
             assert(a:clear())
             ngx.sleep(0.3)
+            b:event_handler("remove", "127.0.0.1", 11111, "127.0.0.1")
             ngx.say(a.status_ver == ver_a, " ", b.status_ver == ver_b)
         }
     }
@@ -151,7 +152,7 @@ true true
 
 
 
-=== TEST 5: what did not bump before still does not: a healthy target added, and a state that keeps the same side
+=== TEST 5: adding a healthy target bumps once, as before; a state that stays on the same side does not; removing it bumps once
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -162,17 +163,21 @@ true true
             assert(a:add_target("127.0.0.1", 11111, nil, true))
             assert(wait_until(function() return status(b, 11111) == "true" end))
             local added = b.status_ver - ver
+            -- healthy -> mostly_healthy: still usable, no bump
+            ver = b.status_ver
+            b:event_handler("mostly_healthy", "127.0.0.1", 11111, "127.0.0.1")
+            local same_side = b.status_ver - ver
             -- removing a healthy target: it is usable before and after for a
             -- caller, but the copy changed, so this bumps as well
             ver = b.status_ver
             assert(a:remove_target("127.0.0.1", 11111, "127.0.0.1"))
             assert(wait_until(function() return status(b, 11111) == "nil/target not found" end))
-            ngx.say(added, " ", b.status_ver - ver)
+            ngx.say(added, " ", same_side, " ", b.status_ver - ver)
         }
     }
 --- request
 GET /t
 --- response_body
-1 1
+1 0 1
 --- no_error_log
 [error]
