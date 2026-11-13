@@ -1985,7 +1985,10 @@ end
 -- A target whose state could not be read from shm in a comparison at
 -- `version`: what the copy has for it stays, and so does the version of it,
 -- unless that is from before the version key was made again from an earlier
--- time (see STALE_VERSION_GAP), when it would keep later events out.
+-- time (see STALE_VERSION_GAP), when it would keep later events out. When the
+-- version key itself is gone, nothing tells whether it will be made again
+-- from an earlier time: the version of the target is dropped, and an older
+-- event of it that arrives after that is applied.
 local function sync_unread(target, version)
   local seen = target.version
   if seen and (not version or seen > version) then
@@ -2005,9 +2008,11 @@ local function sync_targets(self, budget, raw, members, version)
   local targets = self.targets
   local state_prefix = self.TARGET_STATE
   local corrected = 0
-  -- without a list nothing tells which targets are listed (a checker that
-  -- has no target either has nothing to compare)
-  local covered = raw ~= nil or targets[1] == nil
+  -- Without a list nothing tells which targets are listed. A checker that
+  -- has no target either has nothing to compare, unless a change was
+  -- announced since this copy was last in step: every change writes the
+  -- list, so it was there and is gone.
+  local covered = raw ~= nil or (targets[1] == nil and version == self.version_applied)
 
   if not members then
     -- same members as when they were last compared: only the statuses
@@ -2158,6 +2163,10 @@ local function sync_from_shm(self, budget)
     -- version. After any other, every event is applied and followed by a
     -- comparison (see `on_event`).
     self.version_applied = covered and version or nil
+    -- The version this copy was last compared at, also when shm could not
+    -- tell everything: the scan of the timer goes by it then, so that a
+    -- change of another checker does not have this one compared again.
+    self.version_compared = version
   end
 
   -- the events that arrived meanwhile
@@ -2295,7 +2304,8 @@ local function run_reconcile()
           for i = 1, checkers_n do
             local checker_obj = checkers[i]
             if checker_obj and checker_obj.shm_name == shm_name and not checker_obj.stopped
-               and checker_obj.shm:get(checker_obj.TARGET_VERSION) ~= checker_obj.version_applied
+               and checker_obj.shm:get(checker_obj.TARGET_VERSION)
+                   ~= (checker_obj.version_applied or checker_obj.version_compared)
             then
               resync_pending[checker_obj] = true
             end
