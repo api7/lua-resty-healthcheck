@@ -32,6 +32,28 @@ our $HttpConfig = qq{
             return true
         end
 
+        -- returns when the events posted so far have been dispatched: the
+        -- events of a worker are dispatched in the order they were posted
+        local flush_seq = 0
+        function flush_events()
+            local we = require "resty.worker.events"
+            flush_seq = flush_seq + 1
+            local seq, seen = flush_seq, false
+            local callback = function(data)
+                if data == seq then
+                    seen = true
+                end
+            end
+            we.register(callback, "test-flush", "marker")
+            we.post("test-flush", "marker", seq)
+            local ok = wait_until(function()
+                we.poll()
+                return seen
+            end)
+            we.unregister(callback, "test-flush", "marker")
+            assert(ok, "the events were not dispatched")
+        end
+
         -- two checkers with the same name stand for the checkers of two
         -- workers: each has its own copy of the targets
         function new_checker(http_failures)
@@ -159,7 +181,7 @@ unhealthy forced for 127.0.0.1 127.0.0.1:11111
             we.register(function(_, event) events[#events + 1] = event end, a.EVENT_SOURCE)
             assert(a:add_target(ip, 11111, nil, true))
             wait_until(function() return #events > 0 end)
-            ngx.sleep(0.2)
+            flush_events()   -- a second event, which must not come, would have arrived
             ngx.say("state=", tostring(shm:get(state_key)), " events=", table.concat(events, ","),
                     " counter=", tostring(shm:get(counter_key)))
         }

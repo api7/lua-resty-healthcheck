@@ -32,6 +32,28 @@ our $HttpConfig = qq{
             return true
         end
 
+        -- returns when the events posted so far have been dispatched: the
+        -- events of a worker are dispatched in the order they were posted
+        local flush_seq = 0
+        function flush_events()
+            local we = require "resty.events.compat"
+            flush_seq = flush_seq + 1
+            local seq, seen = flush_seq, false
+            local callback = function(data)
+                if data == seq then
+                    seen = true
+                end
+            end
+            we.register(callback, "test-flush", "marker")
+            we.post("test-flush", "marker", seq)
+            local ok = wait_until(function()
+                we.poll()
+                return seen
+            end)
+            we.unregister(callback, "test-flush", "marker")
+            assert(ok, "the events were not dispatched")
+        end
+
         -- two checkers with the same name stand for the checkers of two
         -- workers: each has its own copy of the targets
         function new_checker(http_failures)
@@ -128,7 +150,8 @@ __DATA__
 
             -- one failed request is enough to mark it unhealthy
             assert(b:report_http_status(ip, 11111, nil, 500, "passive"))
-            ngx.sleep(0.3)
+            -- an event that should not have been raised would have arrived
+            flush_events()
             ngx.say("listed=", #healthcheck.get_target_list("testing", "test_shm"),
                     " a=", status(a, 11111), " state=", tostring(shm:get(state_key)),
                     " counter=", tostring(shm:get(key_of(a.TARGET_COUNTER, 11111))))
@@ -165,7 +188,8 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
             local count = function() events = events + 1 end
             we.register(count, a.EVENT_SOURCE)
             local ok = b:set_target_status(ip, 11111, nil, false)
-            ngx.sleep(0.3)
+            -- an event that should not have been raised would have arrived
+            flush_events()
             ngx.say(tostring(ok), " state=", tostring(shm:get(state_key)), " events=", events,
                     " counter=", tostring(shm:get(key_of(a.TARGET_COUNTER, 11111))))
         }
@@ -297,7 +321,7 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
             -- the caller says healthy, as callers do by default
             assert(a:add_target(ip, 11111, nil, true))
             assert(wait_until(function() return #events > 0 end))
-            ngx.sleep(0.1)   -- room for a second event, which must not come
+            flush_events()   -- a second event, which must not come, would have arrived
             ngx.say("state=", tostring(shm:get(state_key)), " events=", table.concat(events, ","),
                     " a=", status(a, 11111))
         }
@@ -474,7 +498,8 @@ applied: true
             we.register(function() events = events + 1 end, a.EVENT_SOURCE)
             assert(a:delayed_clear(10))
             assert(a:add_target(ip, 11111, nil, true))
-            ngx.sleep(0.3)
+            -- an event that should not have been raised would have arrived
+            flush_events()
             ngx.say("b=", status(b, 11111), " state=", tostring(shm:get(state_key)),
                     " events=", events)
         }
@@ -624,7 +649,8 @@ failed to write state 'unhealthy' of 127.0.0.1 127.0.0.1:11111 to shm: no memory
                 return status(a, 11111, "one.test") == "nil/target not found"
             end))
             assert(b:report_http_status(ip, 11111, "one.test", 500, "passive"))
-            ngx.sleep(0.3)
+            -- an event that should not have been raised would have arrived
+            flush_events()
             ngx.say("listed=", #healthcheck.get_target_list("testing", "test_shm"),
                     " one=", status(a, 11111, "one.test"),
                     " state=", tostring(shm:get(key_of(a.TARGET_STATE, 11111, "one.test"))),
@@ -661,7 +687,7 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
             we.register(function(_, event) events[#events + 1] = event end, c.EVENT_SOURCE)
             assert(c:add_target(ip, 11111, nil, true))
             assert(wait_until(function() return #events > 0 end))
-            ngx.sleep(0.1)   -- room for a second event, which must not come
+            flush_events()   -- a second event, which must not come, would have arrived
             ngx.say("state=", tostring(shm:get(state_key)), " events=", table.concat(events, ","))
         }
     }

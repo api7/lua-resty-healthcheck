@@ -17,6 +17,36 @@ our $HttpConfig = qq{
         _G.__TESTING_HEALTHCHECKER = true
         ip = "127.0.0.1"
 
+        -- Every run of the periodic cleanup begins by taking a key that ends
+        -- in ":cleanup" with add(), in the shm of the first checker of the
+        -- worker: the runs are counted.
+        local cleanup_runs = 0
+        local shm_methods = getmetatable(ngx.shared.test_shm).__index
+        local shm_add = shm_methods.add
+        shm_methods.add = function(dict, key, ...)
+            local ok, err, forcible = shm_add(dict, key, ...)
+            if ok and type(key) == "string" and key:sub(-8) == ":cleanup" then
+                cleanup_runs = cleanup_runs + 1
+            end
+            return ok, err, forcible
+        end
+
+        -- waits until `runs` more of them have begun (5 s at most). A run is
+        -- short and the next one begins an interval later: when two have
+        -- begun, the first one is done.
+        function wait_cleanups(runs)
+            local target = cleanup_runs + runs
+            local deadline = ngx.now() + 5
+            while cleanup_runs < target do
+                ngx.update_time()
+                if ngx.now() >= deadline then
+                    return false
+                end
+                ngx.sleep(0.01)
+            end
+            return true
+        end
+
         function new_checker(shm_name, name)
             if not worker_events_configured then
                 local we = require "resty.worker.events"
@@ -150,7 +180,7 @@ increase the size of this lua_shared_dict
 
             -- evicted from a full shm; the periodic cleanup reads the list
             ngx.shared.test_shm:delete(checker.TARGET_LIST)
-            ngx.sleep(0.8)
+            assert(wait_cleanups(2), "the periodic cleanup did not run")
             ngx.say("done")
         }
     }
@@ -172,12 +202,12 @@ qr/\[error\].*\[healthcheck\] shm 'test_shm' no longer has the target list of ch
             healthcheck._set_cleanup_interval(0.2)
             local checker = new_checker("test_shm")
             -- no target list in the shm yet, and no targets in this worker
-            ngx.sleep(0.5)
+            assert(wait_cleanups(2), "the periodic cleanup did not run")
             assert(checker:add_target(ip, 11111, nil, true))
             assert(checker:set_target_status(ip, 11111, nil, false) ~= nil)
             assert(checker:remove_target(ip, 11111, ip))
             assert(checker:clear())
-            ngx.sleep(0.5)
+            assert(wait_cleanups(2), "the periodic cleanup did not run")
             ngx.say("done")
         }
     }
@@ -211,7 +241,7 @@ qr/\[healthcheck\] shm '/
 
             -- the list is lost; the periodic cleanup reads it
             ngx.shared.small_shm:delete(checker.TARGET_LIST)
-            ngx.sleep(0.8)
+            assert(wait_cleanups(2), "the periodic cleanup did not run")
             ngx.say("done")
         }
     }
