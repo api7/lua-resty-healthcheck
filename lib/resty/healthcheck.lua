@@ -333,6 +333,13 @@ local function report_shm(shm_name, level, before, key, after)
 end
 
 
+local FAILED = " could not be stored, and the value it had before, if any, is gone"
+local FAILED_EVICTED = " could not be stored, other entries were evicted trying, " ..
+                       "and the value it had before, if any, is gone"
+local FAILED_MAYBE_EVICTED = " could not be stored, other entries may have been " ..
+                             "evicted trying, and the value it had before, if any, is gone"
+
+
 -- Returns the shm `shm_name` wrapped so that every write is checked: a write
 -- that evicted other entries, or that failed for lack of memory, is reported.
 -- Everything else is passed through.
@@ -356,11 +363,12 @@ local function watched_shm(shm_name)
       -- the shm evicts entries before it gives up, so `forcible` can be set
       -- here as well; and it removes the value the key had before it tries
       -- to store the new one
+      -- incr() does not return `forcible` when it fails, although it evicts
+      -- entries like the others
       report_shm(shm_name, ERR, "is full: ", tostring(key),
-                 forcible and " could not be stored, other entries were evicted " ..
-                              "trying, and the value it had before, if any, is gone"
-                           or " could not be stored, and the value it had before, " ..
-                              "if any, is gone")
+                 forcible and FAILED_EVICTED
+                 or forcible == nil and FAILED_MAYBE_EVICTED
+                 or FAILED)
     elseif forcible then
       report_shm(shm_name, WARN, "is full: storing ", tostring(key),
                  " evicted other entries")
