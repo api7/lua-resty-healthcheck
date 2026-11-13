@@ -133,6 +133,14 @@ raises no event. It logs `reconciled <n> target(s) with shm` at info level
 when it had something to correct, and increments `status_ver` as an event
 would.
 
+A comparison can only take from the shm what is there. When the state of a
+listed target, or the target list, was evicted from a shm that is full, the
+worker keeps what it has for it. Until a comparison can read everything again,
+it also applies every event of that checker when it comes, late or not, and
+compares the checker again after each. The events of one target are applied
+in the order of its changes, so one that arrives after a later one changes
+nothing.
+
 The data of an event has three more fields for this: `version`,
 `shm_version` and `shm`. Events without them, from workers that still run an
 older version of this library during a reload, are applied as before.
