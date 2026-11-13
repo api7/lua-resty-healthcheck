@@ -14,6 +14,36 @@ our $HttpConfig = qq{
     lua_shared_dict my_worker_events 8m;
 
     init_worker_by_lua_block {
+        -- Every run of the periodic cleanup begins by taking a key that ends
+        -- in ":cleanup" with add(), in the shm of the first checker of the
+        -- worker: the runs are counted.
+        local cleanup_runs = 0
+        local shm_methods = getmetatable(ngx.shared.test_shm).__index
+        local shm_add = shm_methods.add
+        shm_methods.add = function(dict, key, ...)
+            local ok, err, forcible = shm_add(dict, key, ...)
+            if ok and type(key) == "string" and key:sub(-8) == ":cleanup" then
+                cleanup_runs = cleanup_runs + 1
+            end
+            return ok, err, forcible
+        end
+
+        -- waits until `runs` more of them have begun (5 s at most). A run is
+        -- short and the next one begins an interval later: when two have
+        -- begun, the first one is done.
+        function wait_cleanups(runs)
+            local target = cleanup_runs + runs
+            local deadline = ngx.now() + 5
+            while cleanup_runs < target do
+                ngx.update_time()
+                if ngx.now() >= deadline then
+                    return false
+                end
+                ngx.sleep(0.01)
+            end
+            return true
+        end
+
         _G.__TESTING_HEALTHCHECKER = true
     }
 };
@@ -70,9 +100,14 @@ __DATA__
             ngx.say(#healthcheck.get_target_list("b", "test_shm2"), " ",
                     tostring(ngx.shared.test_shm:get(b.TARGET_LIST)), " ",
                     a ~= nil)
-            -- a few more cleanup rounds (0.2s each): the target must not be
-            -- purged again
-            ngx.sleep(0.7)
+            -- the event of that removal, and then a few more runs of the
+            -- cleanup: the target must not be purged again
+            deadline = ngx.now() + 5
+            while removes == 0 and ngx.now() < deadline do
+                ngx.sleep(0.01)
+                ngx.update_time()
+            end
+            assert(wait_cleanups(3), "the periodic cleanup did not run")
             ngx.say("remove events: ", removes)
         }
     }
