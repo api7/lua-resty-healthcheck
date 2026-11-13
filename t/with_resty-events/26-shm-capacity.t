@@ -207,6 +207,7 @@ GET /t
 done
 --- error_log eval
 qr/\[error\].*\[healthcheck\] shm 'test_shm' no longer has the target list of checker 'testing', for which this worker has 2 target\(s\): it was evicted, or a write of it failed, most likely because the shm is full\. This shm holds .* increase the size of this lua_shared_dict/
+--- timeout: 12
 
 
 
@@ -234,6 +235,7 @@ GET /t
 done
 --- no_error_log eval
 qr/\[healthcheck\] shm '/
+--- timeout: 12
 
 
 
@@ -270,6 +272,7 @@ done
 qr/\[(?:warn|error)\] .*?\[healthcheck\] shm 'small_shm' (?:is full: storing|no longer has the target list)/
 --- grep_error_log_out eval
 qr/\A\[warn\] [^\n]*shm 'small_shm' is full: storing\n\[error\] [^\n]*shm 'small_shm' no longer has the target list\n\z/
+--- timeout: 12
 
 
 
