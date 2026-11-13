@@ -519,11 +519,16 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
     -- A target re-added inside the purge window keeps the state it has in
     -- shm: probes and reports write it under the target lock, so it must not
     -- be overwritten here from this worker's copy, which may be older. Only a
-    -- missing state is filled in.
+    -- missing state (evicted from a full shm) is filled in, with the status
+    -- this worker has for the target if it has one.
     local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
     local ok, err
     local state_filled = false
     if found then
+      local known = get_target(self, ip, port, hostname)
+      if known and known.internal_health then
+        internal_health = known.internal_health
+      end
       ok, err = self.shm:add(state_key, INTERNAL_STATES[internal_health])
       if ok then
         state_filled = true
@@ -531,10 +536,14 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
         ok, err = true, nil
       end
     else
+      -- a new target counts from zero: a report made for it after an earlier
+      -- removal, by a worker whose copy still had it, can have left a counter
+      self.shm:delete(key_for(self.TARGET_COUNTER, ip, port, hostname))
       ok, err = self.shm:set(state_key, INTERNAL_STATES[internal_health])
     end
     if not ok then
-      -- a listed target without a state is never probed: do not publish it
+      -- a checker created later would load a listed target without a state
+      -- as having no status: do not publish it
       return nil, "failed to set initial health status in shm: " .. err
     end
 
@@ -883,11 +892,23 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
 
     if new_health and new_health ~= current_health then
       local written, write_err = write_target_state(self, ip, port, hostname, new_health)
+      if written == false then
+        -- removed meanwhile by another worker: nothing is left to count
+        self.shm:delete(counter_key)
+        self:log(DEBUG, "not changing the state of a target that was removed: ",
+                        hostname, " ", ip, ":", port)
+        return true
+      end
+
+      if written == nil then
+        -- e.g. the shm is full. The other workers are told anyway, as they
+        -- were before: the target did reach its threshold.
+        self:log(ERR, "failed to write state '", new_health, "' of ", hostname,
+                      " ", ip, ":", port, " to shm: ", write_err)
+      end
+      self:raise_event(self.events[new_health], ip, port, hostname)
       if written == nil then
         return nil, write_err
-      end
-      if written then
-        self:raise_event(self.events[new_health], ip, port, hostname)
       end
     end
 
@@ -1076,19 +1097,28 @@ function checker:set_target_status(ip, port, hostname, is_healthy)
   local ok, err = locking_target(self, ip, port, hostname, function()
 
     local written, write_err = write_target_state(self, ip, port, hostname, health_report)
-    if written == nil then
-      return nil, write_err
-    end
-    if not written then
+    if written == false then
       -- removed meanwhile by another worker
+      self:log(DEBUG, "not setting the status of a target that was removed: ",
+                      hostname, " ", ip, ":", port)
       return true
     end
 
-    -- the state is changed: announce it before anything else can fail
+    if written == nil then
+      -- e.g. the shm is full. The other workers are told anyway, as they
+      -- were before.
+      self:log(ERR, "failed to write state '", health_report, "' of ", hostname,
+                    " ", ip, ":", port, " to shm: ", write_err)
+    end
+
+    -- announce the change before anything else can fail
     self:raise_event(self.events[health_report], ip, port, hostname)
     self:log(WARN, health_report, " forced for ", hostname, " ", ip, ":", port)
 
     local _, err = self.shm:set(counter_key, 0)
+    if written == nil then
+      return nil, write_err
+    end
     if err then
       return nil, err
     end
