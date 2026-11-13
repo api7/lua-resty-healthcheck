@@ -171,3 +171,45 @@ GET /t
 0
 --- no_error_log
 [error]
+
+
+
+=== TEST 4: when the poll fails, new() leaves no subscription behind
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local we = require "resty.events.compat"
+            local registered = {}
+            local orig_register, orig_poll = we.register_weak, we.poll
+            we.register_weak = function(callback, ...)
+                registered[#registered + 1] = callback
+                return orig_register(callback, ...)
+            end
+            -- as lua-resty-events' poll() does in a phase where it cannot sleep
+            we.poll = function() error("poll failed") end
+            local ok, err = pcall(new_checker)
+            we.register_weak, we.poll = orig_register, orig_poll
+
+            -- the checker that new() never returned must not handle events
+            local handled = 0
+            if registered[1] then
+                local name, never_returned = debug.getupvalue(registered[1], 1)
+                assert(name == "self")
+                never_returned.event_handler = function() handled = handled + 1 end
+            end
+            local a = new_checker()
+            assert(a:add_target("127.0.0.1", 11111, nil, true))
+            assert(wait_until(function() return a:get_target_status("127.0.0.1", 11111) end))
+            assert(a:set_target_status("127.0.0.1", 11111, nil, false))
+            assert(wait_until(function() return a:get_target_status("127.0.0.1", 11111) == false end))
+            ngx.sleep(0.2)
+            ngx.say(tostring(ok), " ", tostring(err):match("poll failed"), " handled=", handled)
+        }
+    }
+--- request
+GET /t
+--- response_body
+false poll failed handled=0
+--- no_error_log
+[error]
