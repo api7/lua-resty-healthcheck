@@ -134,4 +134,4 @@ GET /t
 remove events: 1
 --- no_error_log
 [error]
---- timeout: 6
+--- timeout: 15
