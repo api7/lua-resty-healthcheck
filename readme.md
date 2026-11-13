@@ -87,6 +87,65 @@ programmatic API using functions such as `checker:report_http_status(host, port,
 See the [online LDoc documentation](http://kong.github.io/lua-resty-healthcheck)
 for the complete API.
 
+## Sizing the shm
+
+All checkers that use the same `shm_name` keep their data in that
+`lua_shared_dict`. Apache APISIX uses one dictionary for all its checkers:
+`upstream-healthcheck`, 10m by default, set under
+`nginx_config.meta.lua_shared_dict` in its `config.yaml`.
+
+What is stored:
+
+| Entry | How many | Size |
+|---|---|---|
+| state of a target | one per target | 256 bytes (*) |
+| counters of a target | one per target, created by the first report or probe result that is counted for it | 256 bytes (*) |
+| target list of a checker | one per checker, a single value | about 50 bytes per target, more with long hostnames or metadata; 256 bytes for one target, 1 KB for 10, whole 4 KB pages above 2 KB |
+
+(*) An entry takes a slot of 128, 256, 512... bytes, depending mostly on the
+length of its key, which contains the name of the checker and the ip, port and
+hostname of the target. 256 bytes is what the names used in the measurements
+below need.
+
+A shm that is full does not refuse a write: it evicts the entries that were
+used least recently, which can be the state of another target or the target
+list of another checker. This library logs it when one of its writes evicts
+entries or fails (`shm '<name>' is full: ...`), and when a checker finds that
+its target list is gone (`shm '<name>' no longer has the target list of
+checker ...`), at most once a minute for each shm in each worker.
+
+How many targets fit depends on how they are spread over the checkers,
+because the target list of a checker is one value: it needs a run of
+contiguous free pages, and it is written again, one entry longer, every time
+a target is added. Measured in a 10m dictionary, with checkers named as APISIX
+names them and targets added until the first write that evicted an entry:
+
+| Targets per checker | Counters | Bytes per target | Targets when the shm was full | Free pages left then |
+|---|---|---|---|---|
+| 1 | no | 512 | 20,300 | 0% |
+| 10 | no | 359 | 29,000 | 0% |
+| 100 | no | 338 | 28,000 | 9% |
+| 1,000 | no | 305 | 19,000 | 45% |
+| 10 | yes | 615 | 16,900 | 0% |
+| 100, with 40-character hostnames | yes | 594 | 16,800 | 5% |
+
+So, to size the dictionary:
+
+- count 512 bytes per target for its state and its counters, plus 50 to 250
+  bytes per target for the target lists (the fewer targets per checker, the
+  more);
+- then leave room for the target lists to be rewritten: with 100 targets per
+  checker the shm was full with a tenth of its pages still free, with 1,000
+  targets per checker with almost half of them free. The free space of the
+  dictionary (`ngx.shared.DICT:free_space()`, exported by APISIX as
+  `apisix_shared_dict_free_space_bytes`) therefore does not tell how many more
+  targets fit when checkers are large;
+- a single number of targets that fits a given size does not exist: 10m held
+  between 16,800 and 29,000 targets in the cases above.
+
+The numbers were measured with OpenResty 1.29.2.4 on a 64-bit Linux with 4 KB
+pages; `t/shm-sizing/measure_shm.lua` reproduces them.
+
 ## History
 
 Versioning is strictly based on [Semantic Versioning](https://semver.org/)
