@@ -57,12 +57,18 @@ local next_sample = 1000
 while not full do
     checkers = checkers + 1
     -- named as Apache APISIX names the checker of an upstream
-    local checker = assert(hc.new({
+    local checker, new_err = hc.new({
         name = "upstream#/apisix/upstreams/" .. (100000000 + checkers),
         shm_name = "hc",
         checks = { active = { healthy = { interval = 0 }, unhealthy = { interval = 0 } },
                    passive = { unhealthy = { http_failures = 3 } } },
-    }))
+    })
+    -- creating a checker can be what fills the shm: it is not counted then
+    if full then
+        checkers = checkers - 1
+        break
+    end
+    assert(checker, "new() failed: " .. tostring(new_err))
     for t = 1, per_checker do
         local i = targets + 1
         local ip = "10." .. (math.floor(i / 62500) % 250) .. "." .. (math.floor(i / 250) % 250) .. "." .. (i % 250)
