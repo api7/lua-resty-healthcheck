@@ -34,8 +34,12 @@ our $HttpConfig = qq{
         -- when it is loaded, which is in the first new_checker() of a test.
         -- `yield_hook = { cond = f, fn = g }` calls g() the next time the
         -- library yields (ngx.sleep(0)) while f() holds.
+        -- With `sleep_log = {}` every sleep is noted there.
         local real_sleep = ngx.sleep
         ngx.sleep = function(seconds)
+            if sleep_log then
+                sleep_log[#sleep_log + 1] = seconds
+            end
             local hook = yield_hook
             if hook and seconds == 0 and hook.cond() then
                 yield_hook = nil

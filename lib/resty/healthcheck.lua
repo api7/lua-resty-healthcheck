@@ -109,17 +109,22 @@ end
 
 
 local worker_events
+-- whether poll() of the events module dispatches the events that wait: the
+-- one of lua-resty-events only sleeps 2 ms
+local poll_dispatches
 --- This function loads the worker events module received as arg. It will throw
 -- error() if it is not possible to load the module.
 local function load_events_module(self)
   if self.events_module == "resty.worker.events" then
     worker_events = require("resty.worker.events")
+    poll_dispatches = true
     assert(worker_events, "could not load lua-resty-worker-events")
     assert(worker_events._VERSION == RESTY_WORKER_EVENTS_VER,
           "unsupported lua-resty-worker-events version")
 
   elseif self.events_module == "resty.events" then
     worker_events = require("resty.events.compat")
+    poll_dispatches = false
     -- another version is used with a warning (once per worker) rather than
     -- refused: refusing it makes new() fail, which leaves the caller without
     -- health checks
@@ -2192,8 +2197,10 @@ local function run_reconcile()
           -- the shm is ahead: the events may be on their way. With
           -- lua-resty-worker-events they wait in its shm for the next poll:
           -- they are dispatched now.
-          pcall(worker_events.poll)
-          expected = tracker.expected
+          if poll_dispatches then
+            pcall(worker_events.poll)
+            expected = tracker.expected
+          end
           if not (expected and expected >= version) then
             ngx_sleep(EVENT_GRACE)
             expected = tracker.expected
@@ -2251,6 +2258,9 @@ local function run_reconcile()
               checker_obj:log(ERR, "failed to reconcile targets with shm (it is tried ",
                                    "again on every run of the timer): ", err)
             end
+          elseif checker_obj.sync_error_logged then
+            -- a failure after this one is a new one
+            checker_obj.sync_error_logged = nil
           end
           sync_spend(budget, SYNC_COST_CHECKER)
         end

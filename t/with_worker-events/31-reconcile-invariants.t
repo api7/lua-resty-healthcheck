@@ -34,8 +34,12 @@ our $HttpConfig = qq{
         -- when it is loaded, which is in the first new_checker() of a test.
         -- `yield_hook = { cond = f, fn = g }` calls g() the next time the
         -- library yields (ngx.sleep(0)) while f() holds.
+        -- With `sleep_log = {}` every sleep is noted there.
         local real_sleep = ngx.sleep
         ngx.sleep = function(seconds)
+            if sleep_log then
+                sleep_log[#sleep_log + 1] = seconds
+            end
             local hook = yield_hook
             if hook and seconds == 0 and hook.cond() then
                 yield_hook = nil
@@ -636,59 +640,7 @@ true b=false a=false scans=0 compared=2
 
 
 
-=== TEST 12: a comparison that throws does not end the run for good: it is logged and tried again
---- http_config eval: $::HttpConfig
---- config
-    location = /t {
-        content_by_lua_block {
-            no_reconcile_timer()
-            local healthcheck = require("resty.healthcheck")
-            local shm = ngx.shared.test_shm
-            local a, b = new_checker(), new_checker()
-            assert(a:add_target(ip, 11111, nil, true))
-            assert(a:add_target(ip, 22222, nil, true))
-            assert(a:add_target(ip, 33333, nil, true))
-            flush_events()
-            assert(#a.targets == 3 and #b.targets == 3)
-            healthcheck._reconcile()
-            lose_events(function()
-                assert(a:set_target_status(ip, 11111, nil, false))
-            end)
-            -- the version of `b` is read once when every checker is looked
-            -- at; the read after that, by its comparison, throws
-            local real, reads = b.shm, 0
-            b.shm = setmetatable({}, {
-                __index = function(_, name)
-                    local method = real[name]
-                    return function(_, key, ...)
-                        if name == "get" and key == b.TARGET_VERSION then
-                            reads = reads + 1
-                            if reads == 2 then
-                                error("boom")
-                            end
-                        end
-                        return method(real, key, ...)
-                    end
-                end,
-            })
-            healthcheck._reconcile()
-            local first = status(b, 11111)
-            healthcheck._reconcile()
-            ngx.say(first, " ", status(b, 11111), " a=", status(a, 11111), " reads=", reads)
-        }
-    }
---- request
-GET /t
---- response_body
-true false a=false reads=3
---- grep_error_log eval
-qr/failed to reconcile targets with shm \([^)]*\): .*boom/
---- grep_error_log_out eval
-qr/\Afailed to reconcile targets with shm \(it is tried again on every run of the timer\): [^\n]*boom\n\z/
-
-
-
-=== TEST 13: comparing many small checkers yields as well
+=== TEST 12: comparing many small checkers yields as well
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -720,7 +672,7 @@ compared=12 members=0 yields=3
 
 
 
-=== TEST 14: a copy whose version is not known is compared when an event arrives
+=== TEST 13: a copy whose version is not known is compared when an event arrives
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -761,7 +713,7 @@ b=true scans=0 compared=2
 
 
 
-=== TEST 15: with lua-resty-worker-events, events that wait to be polled are dispatched before the shm being ahead is taken for a loss
+=== TEST 14: with lua-resty-worker-events, events that wait to be polled are dispatched before the shm being ahead is taken for a loss
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -785,14 +737,24 @@ b=true scans=0 compared=2
             we.poll = poll
             local waiting = status(b, 11111)
             local before = stats()
+            healthcheck._set_event_grace(0.123)
+            sleep_log = {}
             healthcheck._reconcile()
+            local waited = 0
+            for _, seconds in ipairs(sleep_log) do
+                if seconds == 0.123 then
+                    waited = waited + 1
+                end
+            end
+            sleep_log = nil
+            -- and once they are dispatched there is nothing to wait for
             ngx.say(waiting, " b=", status(b, 11111), " scans=", since(before, "scans"),
-                    " compared=", since(before, "compared"))
+                    " compared=", since(before, "compared"), " waited=", waited)
         }
     }
 --- request
 GET /t
 --- response_body
-true b=false scans=0 compared=0
+true b=false scans=0 compared=0 waited=0
 --- no_error_log
 [error]

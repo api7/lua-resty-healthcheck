@@ -34,8 +34,12 @@ our $HttpConfig = qq{
         -- when it is loaded, which is in the first new_checker() of a test.
         -- `yield_hook = { cond = f, fn = g }` calls g() the next time the
         -- library yields (ngx.sleep(0)) while f() holds.
+        -- With `sleep_log = {}` every sleep is noted there.
         local real_sleep = ngx.sleep
         ngx.sleep = function(seconds)
+            if sleep_log then
+                sleep_log[#sleep_log + 1] = seconds
+            end
             local hook = yield_hook
             if hook and seconds == 0 and hook.cond() then
                 yield_hook = nil
@@ -510,8 +514,8 @@ compared=0
 --- config
     location = /locked {
         content_by_lua_block {
-            -- the target list is locked for 0.6 s
-            local lock = assert(require("resty.lock"):new("test_shm", { exptime = 0.6, timeout = 0 }))
+            -- the target list is locked until the test unlocks it
+            local lock = assert(require("resty.lock"):new("test_shm", { exptime = 5, timeout = 0 }))
             assert(lock:lock(package.loaded.list_lock_key))
             package.loaded.list_lock = lock
             ngx.say("locked")
@@ -542,6 +546,7 @@ compared=0
             assert(a:set_target_status(ip, 11111, nil, false))
             ngx.sleep(0.25)
             local still = c.targets ~= nil
+            assert(package.loaded.list_lock:unlock())
             local ok = wait_until(function()
                 return c.targets ~= nil and status(c, 11111) == "false"
             end, 3)
