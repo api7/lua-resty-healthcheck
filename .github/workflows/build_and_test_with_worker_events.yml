@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [master]
 
+# the jobs only fetch code: no write access for the token
+permissions:
+  contents: read
+
 jobs:
   build:
     name: CI using lua-resty-worker-events
