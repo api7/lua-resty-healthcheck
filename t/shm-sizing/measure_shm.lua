@@ -6,7 +6,7 @@
 -- lua-resty-worker-events on the Lua path:
 --
 --   TARGETS_PER_CHECKER=10 HOSTNAME_LEN=0 COUNTERS=0 \
---     resty --shdict "hc 10m" --shdict "ev 8m" \
+--     resty --shdict "hc 10m" --shdict "ev 32m" \
 --           --main-conf "env TARGETS_PER_CHECKER; env HOSTNAME_LEN; env COUNTERS;" \
 --           t/shm-sizing/measure_shm.lua
 --
@@ -19,6 +19,7 @@ local we = require "resty.worker.events"
 assert(we.configure{ shm = "ev", interval = 1 })
 
 local per_checker = tonumber(os.getenv("TARGETS_PER_CHECKER")) or 10
+assert(per_checker >= 1, "TARGETS_PER_CHECKER must be 1 or more")
 local host_len = tonumber(os.getenv("HOSTNAME_LEN")) or 0
 local with_counters = os.getenv("COUNTERS") == "1"
 local shm = ngx.shared.hc
@@ -33,7 +34,9 @@ for _, name in ipairs({ "set", "add", "replace", "incr" }) do
         local ok, err, forcible = orig(dict, key, ...)
         if dict == shm and not full and (forcible or err == "no memory") then
             full = name .. " of " .. tostring(key):gsub("%d+%.%d+%.%d+%.%d+.*", "<target>") ..
-                   (forcible and " evicted entries" or " failed: no memory")
+                   (err == "no memory"
+                    and (" failed: no memory" .. (forcible and ", after evicting entries" or ""))
+                    or " evicted entries")
         end
         return ok, err, forcible
     end

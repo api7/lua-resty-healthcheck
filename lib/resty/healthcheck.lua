@@ -266,36 +266,16 @@ end
 local LOCK_TIMEOUT = 5
 
 -- Capacity diagnostics.
--- A shm that is full does not fail a write: it evicts its least recently used
--- entries to make room, and only says so in the third return value of the
--- write. What it evicts can be the state of another target or the target list
--- of another checker, which then stop being checked correctly, so this is
--- reported, at most once per SHM_REPORT_INTERVAL for each shm in each worker.
+-- A write to a shm that is full first evicts the least recently used entries
+-- to make room, and only says so in its third return value; if that does not
+-- free a large enough block, it fails with "no memory", after the evictions
+-- and after the value the key had before was removed. What is lost can be the
+-- state of another target or the target list of a checker, which then stop
+-- being checked correctly, so this is reported: at most once per
+-- SHM_REPORT_INTERVAL for each shm, in each worker, at each log level, so that
+-- a warning about evictions does not hide an error about a lost list.
 local SHM_REPORT_INTERVAL = 60
-local shm_reports = {}  -- shm name => { last = time of the last report, skipped = n }
-
-local function report_shm(shm_name, level, problem)
-  local now = ngx_now()
-  local report = shm_reports[shm_name]
-  if not report then
-    report = { last = -SHM_REPORT_INTERVAL, skipped = 0 }
-    shm_reports[shm_name] = report
-  end
-  if now - report.last < SHM_REPORT_INTERVAL then
-    report.skipped = report.skipped + 1
-    return
-  end
-
-  local skipped = report.skipped
-  report.last, report.skipped = now, 0
-  ngx_log(level, LOG_PREFIX, "shm '", shm_name, "' ", problem,
-          ". This shm holds the target list of each checker and the state of ",
-          "each target, and one that is lost stops being checked correctly: ",
-          "increase the size of this lua_shared_dict",
-          skipped > 0 and (" (" .. skipped .. " more report(s) like this were " ..
-                           "skipped since the last one)") or "")
-end
-
+local shm_reports = {}  -- shm name => level => { last = time of the last report, skipped = n }
 
 local function describe_key(key)
   if key:sub(-12) == ":target_list" then
@@ -306,6 +286,40 @@ local function describe_key(key)
     return "the counter of a target"
   end
   return "a key"
+end
+
+
+-- The message is `before`, then the description of `key` if one is given,
+-- then `after`: it is only put together for a report that is logged.
+local function report_shm(shm_name, level, before, key, after)
+  local reports = shm_reports[shm_name]
+  if not reports then
+    reports = {}
+    shm_reports[shm_name] = reports
+  end
+  local report = reports[level]
+  if not report then
+    report = { skipped = 0 }
+    reports[level] = report
+  end
+
+  local now = ngx_now()
+  local since = report.last and now - report.last
+  -- a clock that was set back does not silence the reports
+  if since and since >= 0 and since < SHM_REPORT_INTERVAL then
+    report.skipped = report.skipped + 1
+    return
+  end
+
+  local skipped = report.skipped
+  report.last, report.skipped = now, 0
+  ngx_log(level, LOG_PREFIX, "shm '", shm_name, "' ", before,
+          key and (describe_key(key) .. " ('" .. key .. "')") or "", after or "",
+          ". This shm holds the target list of each checker and the state of ",
+          "each target, and one that is lost stops being checked correctly: ",
+          "increase the size of this lua_shared_dict",
+          skipped > 0 and (" (" .. skipped .. " more report(s) like this were " ..
+                           "skipped since the last one)") or "")
 end
 
 
@@ -325,18 +339,23 @@ local function watched_shm(shm_name)
     return nil
   end
 
-  local function check(key, ok, err, forcible)
+  -- returns what the write returned, unchanged
+  local function check(key, ...)
+    local ok, err, forcible = ...
     if not ok and err == "no memory" then
       -- the shm evicts entries before it gives up, so `forcible` can be set
-      -- here as well
-      report_shm(shm_name, ERR, "is full: " .. describe_key(key) .. " ('" ..
-                 key .. "') could not be stored" ..
-                 (forcible and ", and other entries were evicted trying" or ""))
+      -- here as well; and it removes the value the key had before it tries
+      -- to store the new one
+      report_shm(shm_name, ERR, "is full: ", tostring(key),
+                 forcible and " could not be stored, other entries were evicted " ..
+                              "trying, and the value it had before, if any, is gone"
+                           or " could not be stored, and the value it had before, " ..
+                              "if any, is gone")
     elseif forcible then
-      report_shm(shm_name, WARN, "is full: storing " .. describe_key(key) ..
-                 " ('" .. key .. "') evicted other entries")
+      report_shm(shm_name, WARN, "is full: storing ", tostring(key),
+                 " evicted other entries")
     end
-    return ok, err, forcible
+    return ...
   end
 
   watched = setmetatable({
@@ -545,10 +564,12 @@ local function fetch_target_list(self)
   end
 
   if not target_list and self.targets and self.targets[1] then
-    -- every change writes the list, even an empty one: it was evicted
+    -- every change writes the list, even an empty one: it was evicted, or
+    -- a write that made it longer failed
     report_shm(self.shm_name, ERR, "no longer has the target list of checker '" ..
                self.name .. "', for which this worker has " .. #self.targets ..
-               " target(s): it was evicted, most likely because the shm is full")
+               " target(s): it was evicted, or a write of it failed, most " ..
+               "likely because the shm is full")
   end
 
   return target_list and deserialize(target_list) or {}
