@@ -715,3 +715,43 @@ GET /t
 compared=1 version_applied is the version in shm=true
 --- no_error_log
 [error]
+
+
+
+=== TEST 13: a target that is removed and added again, the second event lost and the list the same as before, is back after the next run
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local shm = ngx.shared.test_shm
+            local a, b = new_checker(), new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(a:add_target(ip, 22222, nil, true))
+            assert(a:add_target(ip, 33333, nil, true))
+            flush_events()
+            assert(#a.targets == 3 and #b.targets == 3)
+            healthcheck._set_sweep(1000, 1)   -- every checker, on every run
+            healthcheck._reconcile()          -- the members are compared, the list is remembered
+            healthcheck._set_sweep(20, 100)
+            local list = shm:get(a.TARGET_LIST)
+            assert(a:remove_target(ip, 33333, ip))
+            flush_events()
+            local removed = status(b, 33333)
+            lose_events(function()
+                assert(a:add_target(ip, 33333, nil, true))
+            end)
+            local before = stats()
+            healthcheck._reconcile()
+            ngx.say("same list=", tostring(shm:get(a.TARGET_LIST) == list), " removed=", removed,
+                    " members compared=", since(before, "members"),
+                    " after a run: b=", status(b, 33333), " a=", status(a, 33333))
+        }
+    }
+--- request
+GET /t
+--- response_body
+same list=true removed=nil/target not found members compared=2 after a run: b=true a=true
+--- no_error_log
+[error]

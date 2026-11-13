@@ -376,7 +376,7 @@ same list=true cleared=0 a=2 b=2
 
 
 
-=== TEST 6: the removal of the last listed target arrives after the event that added it again: the target is back after the next run
+=== TEST 6: the removal of the last listed target arrives after the event that added it again: it is not applied
 --- http_config eval: $::HttpConfig
 --- config
     location = /t {
@@ -409,7 +409,7 @@ same list=true cleared=0 a=2 b=2
 --- request
 GET /t
 --- response_body
-same list=true after the late removal: nil/target not found after a run: b=true a=true
+same list=true after the late removal: true after a run: b=true a=true
 --- no_error_log
 [error]
 
