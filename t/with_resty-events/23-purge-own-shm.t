@@ -64,6 +64,13 @@ __DATA__
             -- purges the targets of every checker
             local a = new_checker("a", "test_shm")
             local b = new_checker("b", "test_shm2")
+            local removes = 0
+            local on_event = function(_, event)
+                if event == "remove" then
+                    removes = removes + 1
+                end
+            end
+            require("resty.events.compat").register(on_event, b.EVENT_SOURCE)
             assert(b:add_target("127.0.0.1", 11111, nil, true))
             assert(b:delayed_clear(0.1))
 
@@ -79,12 +86,17 @@ __DATA__
             ngx.say(#healthcheck.get_target_list("b", "test_shm2"), " ",
                     tostring(ngx.shared.test_shm:get(b.TARGET_LIST)), " ",
                     a ~= nil)
+            -- a few more cleanup rounds (0.2s each): the target must not be
+            -- purged again
+            ngx.sleep(0.7)
+            ngx.say("remove events: ", removes)
         }
     }
 --- request
 GET /t
 --- response_body
 0 nil true
+remove events: 1
 --- no_error_log
 [error]
 --- timeout: 6
