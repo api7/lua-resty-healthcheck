@@ -604,14 +604,14 @@ qr/\[error\](?!.*lua tcp socket read timed out)/
                 methods[name] = method
             end
             ngx.say("corrected=", since(before, "corrected"), " b=", status(b, 11111), ",",
-                    status(b, 22222), ",", status(b, 44444), " writes=", #writes, " ",
-                    table.concat(writes, "; "))
+                    status(b, 22222), ",", status(b, 44444), " writes=", #writes, " [",
+                    table.concat(writes, "; "), "]")
         }
     }
 --- request
 GET /t
 --- response_body
-corrected=6 b=false,nil/target not found,false writes=0 
+corrected=6 b=false,nil/target not found,false writes=0 []
 --- no_error_log eval
 qr/\[error\](?!.*lua tcp socket read timed out)/
 

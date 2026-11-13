@@ -159,7 +159,12 @@ qq{
 --- config
     location = /t {
         content_by_lua_block {
-            ngx.sleep(0.5)
+            -- the timer that loads the targets runs once the lock is free
+            local deadline = ngx.now() + 3
+            while not b.targets and ngx.now() < deadline do
+                ngx.sleep(0.01)
+                ngx.update_time()
+            end
             ngx.say("targets right after new(): ", targets_after_new)
             ngx.say("loaded later: ", type(b.targets), " ",
                     tostring(b:get_target_status("127.0.0.1", 11111)))

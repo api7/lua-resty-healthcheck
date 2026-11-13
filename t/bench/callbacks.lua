@@ -239,6 +239,9 @@ if scenario == "clear" then
     times[r] = deliver(b.ev_callback)
     tick()
     assert(#b.targets == 0, "the receiving checker still has targets")
+    -- the checkers of a round are not kept for the next ones
+    a:stop()
+    b:stop()
   end
   report("event callback of the receiving checker, on `clear`", times)
 
@@ -271,10 +274,12 @@ elseif scenario == "status" or scenario == "missed" or scenario == "late" then
   for _ = 1, 110 do tick() end
   local before = stats()
   local event_times, tick_times, reconcile_times, slices, cpu_slices = {}, {}, {}, {}, {}
-  local healthy, wrong = true, 0
+  -- the status each checker was last given: every round changes one
+  local given, wrong = {}, 0
   for r = 1, rounds do
-    healthy = not healthy
     local c = (r - 1) % n_checkers + 1
+    local healthy = given[c] == false
+    given[c] = healthy
     assert(a[c]:set_target_status(addr(1), 8080, nil, healthy))
     if scenario ~= "late" then
       event_times[r] = deliver(b[c].ev_callback, scenario == "missed")
@@ -317,6 +322,8 @@ elseif scenario == "remove" then
     end
     totals[r], longest_calls[r] = total, longest
     assert(#b.targets == 0, "the receiving checker still has targets")
+    a:stop()
+    b:stop()
   end
   report("event callbacks of the receiving checker, all removals", totals)
   report("longest single event callback", longest_calls)
@@ -352,6 +359,8 @@ elseif scenario == "remove-missed" then
     if #b.targets ~= #list then
       wrong = wrong + 1
     end
+    a:stop()
+    b:stop()
   end
   report("one pass of the timers after the removals", tick_times)
   report("longest stretch without a yield in that pass", slices)

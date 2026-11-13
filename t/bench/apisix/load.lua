@@ -57,13 +57,20 @@ local function worker_cpu()
     return total, n
 end
 
--- every worker gets a checker for every upstream
-local pinned = {}
+-- every worker gets a checker for every upstream. The server closes a
+-- connection after a number of requests: the request is made again on a new
+-- one to the same worker.
 for w = 0, workers - 1 do
-    pinned[w] = conn_to(w)
+    local c = conn_to(w)
     for i = 1, upstreams do
-        get(pinned[w], "/hello/" .. i)
+        local status = get(c, "/hello/" .. i)
+        if not status then
+            c = conn_to(w)
+            status = get(c, "/hello/" .. i)
+        end
+        assert(status == 200, "warm-up of /hello/" .. i .. " in worker " .. w .. ": " .. tostring(status))
     end
+    c:close()
 end
 ngx.sleep(settle)
 
@@ -107,7 +114,10 @@ for k = 1, conns do
         end
     end)
 end
-for k = 1, conns do ngx.thread.wait(threads[k]) end
+for k = 1, conns do
+    local ok, err = ngx.thread.wait(threads[k])
+    assert(ok, "a load thread failed: " .. tostring(err))
+end
 local elapsed = (now_us() - t_start) / 1e6
 local cpu1 = worker_cpu()
 local after = hookstats()

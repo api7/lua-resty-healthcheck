@@ -1,6 +1,7 @@
--- Loaded by APISIX through apisix.lua_module_hook. With LOSE_PERCENT set, that
--- share of the health check events reaches no callback in the worker that
--- should get them: events lost in transport.
+-- Loaded by APISIX through apisix.lua_module_hook. It counts the health check
+-- events each worker gets, and with LOSE_PERCENT set, that share of them
+-- reaches no callback in the worker that should get them: events lost in
+-- transport.
 -- gives access to the counters of the reconciliation, where the library has them
 rawset(_G, "__TESTING_HEALTHCHECKER", true)
 local we = require("resty.events.compat")
@@ -8,7 +9,7 @@ local json = require("cjson.safe")
 local lose = tonumber(os.getenv("LOSE_PERCENT") or "0") or 0
 local lost, seen = 0, 0
 
-if lose > 0 then
+do
     local wrapped = setmetatable({}, { __mode = "k" })
     -- every callback of a worker gets the same data table for an event
     local verdict = setmetatable({}, { __mode = "k" })
@@ -22,7 +23,7 @@ if lose > 0 then
                     local drop = verdict[data]
                     if drop == nil then
                         seen = seen + 1
-                        drop = math.random(100) <= lose
+                        drop = lose > 0 and math.random(100) <= lose
                         verdict[data] = drop
                         if drop then
                             lost = lost + 1

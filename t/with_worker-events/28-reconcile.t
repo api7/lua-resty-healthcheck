@@ -179,6 +179,8 @@ __DATA__
                 return status(a, 11111) == "false" and status(b, 11111) == "false"
             end, 1)
             ngx.sleep(0.3)
+            -- what was raised until now has been dispatched
+            flush_events()
             ngx.say(tostring(ok), " a=", status(a, 11111), " b=", status(b, 11111),
                     " status_ver+", b.status_ver - ver, " events=", raised)
         }
@@ -473,29 +475,31 @@ GET /t
 --- config
     location = /t {
         content_by_lua_block {
+            no_reconcile_timer()
             local healthcheck = require("resty.healthcheck")
-            local shm = ngx.shared.test_shm
-            local a, b = new_checker(), new_checker()
-            assert(a:add_target(ip, 11111, nil, true))
-            assert(a:add_target(ip, 22222, nil, true))
-            assert(a:add_target(ip, 33333, nil, true))
-            flush_events()
-            assert(#a.targets == 3 and #b.targets == 3)
+            -- created first, so that the versions of the other shm are ahead
+            -- of its own: an event from there is not taken for a late one
             local c = new_checker("testing", "other_shm")
             assert(c:add_target(ip, 11111, nil, true))
-            assert(wait_until(function() return status(c, 11111) == "true" end))
+            flush_events()
+            ngx.sleep(0.02)
+            local a, b = new_checker(), new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            flush_events()
+            healthcheck._reconcile()
+            local before = stats()
             assert(a:set_target_status(ip, 11111, nil, false))
-            assert(wait_until(function()
-                return status(a, 11111) == "false" and status(b, 11111) == "false"
-            end))
-            ngx.sleep(0.3)
+            flush_events()
             ngx.say("a=", status(a, 11111), " b=", status(b, 11111), " c=", status(c, 11111))
+            healthcheck._reconcile()
+            ngx.say("compared=", since(before, "compared"))
         }
     }
 --- request
 GET /t
 --- response_body
 a=false b=false c=true
+compared=0
 --- no_error_log
 [error]
 
