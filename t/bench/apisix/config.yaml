@@ -1,0 +1,16 @@
+deployment:
+  role: data_plane
+  role_data_plane:
+    config_provider: yaml
+apisix:
+  node_listen: 9080
+  enable_admin: false
+  extra_lua_path: "/bench/hook/?.lua"
+  lua_module_hook: "bench_hook"
+nginx_config:
+  worker_processes: 2
+  error_log_level: warn
+  envs:
+    - LOSE_PERCENT
+  http:
+    enable_access_log: false

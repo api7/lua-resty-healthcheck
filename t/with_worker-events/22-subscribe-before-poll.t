@@ -207,8 +207,14 @@ loaded later: table false
             -- the checker that new() never returned must not handle events
             local handled = 0
             if registered[1] then
-                local name, never_returned = debug.getupvalue(registered[1], 1)
-                assert(name == "self")
+                local never_returned
+                for i = 1, 10 do
+                    local name, value = debug.getupvalue(registered[1], i)
+                    if name == "self" then
+                        never_returned = value
+                    end
+                end
+                assert(never_returned)
                 never_returned.event_handler = function() handled = handled + 1 end
             end
             local a = healthcheck.new(opts)
