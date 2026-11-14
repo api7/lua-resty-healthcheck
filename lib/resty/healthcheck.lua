@@ -253,6 +253,130 @@ end
 -- resty.lock timeout when yieldable
 local LOCK_TIMEOUT = 5
 
+-- Capacity diagnostics.
+-- A write to a shm that is full first evicts the least recently used entries
+-- to make room, and only says so in its third return value; if that does not
+-- free a large enough block, it fails with "no memory", after the evictions
+-- and after the value the key had before was removed. What is lost can be the
+-- state of another target or the target list of a checker, which then stop
+-- being checked correctly, so this is reported: at most once per
+-- SHM_REPORT_INTERVAL for each shm, in each worker, at each log level, so that
+-- a warning about evictions does not hide an error about a lost list.
+local SHM_REPORT_INTERVAL = 60
+local shm_reports = {}  -- shm name => level => { last = time of the last report, skipped = n }
+
+local function describe_key(key)
+  if key:sub(-12) == ":target_list" then
+    return "a target list"
+  elseif key:find(":state:", 1, true) then
+    return "the state of a target"
+  elseif key:find(":counter:", 1, true) then
+    return "the counter of a target"
+  end
+  return "a key"
+end
+
+
+-- The message is `before`, then the description of `key` if one is given,
+-- then `after`: it is only put together for a report that is logged.
+local function report_shm(shm_name, level, before, key, after)
+  local reports = shm_reports[shm_name]
+  if not reports then
+    reports = {}
+    shm_reports[shm_name] = reports
+  end
+  local report = reports[level]
+  if not report then
+    report = { skipped = 0 }
+    reports[level] = report
+  end
+
+  local now = ngx_now()
+  local since = report.last and now - report.last
+  -- a clock that was set back does not silence the reports
+  if since and since >= 0 and since < SHM_REPORT_INTERVAL then
+    report.skipped = report.skipped + 1
+    return
+  end
+
+  local skipped = report.skipped
+  report.last, report.skipped = now, 0
+  ngx_log(level, LOG_PREFIX, "shm '", shm_name, "' ", before,
+          key and (describe_key(key) .. " ('" .. key .. "')") or "", after or "",
+          ". This shm holds the target list of each checker and the state of ",
+          "each target, and one that is lost stops being checked correctly: ",
+          "increase the size of this lua_shared_dict",
+          skipped > 0 and (" (" .. skipped .. " more report(s) like this were " ..
+                           "skipped since the last one)") or "")
+end
+
+
+local FAILED = " could not be stored, and the value it had before, if any, is gone"
+local FAILED_EVICTED = " could not be stored, other entries were evicted trying, " ..
+                       "and the value it had before, if any, is gone"
+local FAILED_MAYBE_EVICTED = " could not be stored, other entries may have been " ..
+                             "evicted trying, and the value it had before, if any, is gone"
+
+
+-- Returns the shm `shm_name` wrapped so that every write is checked: a write
+-- that evicted other entries, or that failed for lack of memory, is reported.
+-- Everything else is passed through.
+local watched_shms = {}
+
+local function watched_shm(shm_name)
+  local watched = watched_shms[shm_name]
+  if watched then
+    return watched
+  end
+
+  local shm = ngx.shared[shm_name]
+  if not shm then
+    return nil
+  end
+
+  -- returns what the write returned, unchanged
+  local function check(key, ...)
+    local ok, err, forcible = ...
+    if not ok and err == "no memory" then
+      -- the shm evicts entries before it gives up, so `forcible` can be set
+      -- here as well; and it removes the value the key had before it tries
+      -- to store the new one
+      -- incr() does not return `forcible` when it fails, although it evicts
+      -- entries like the others
+      report_shm(shm_name, ERR, "is full: ", tostring(key),
+                 forcible and FAILED_EVICTED
+                 or forcible == nil and FAILED_MAYBE_EVICTED
+                 or FAILED)
+    elseif forcible then
+      report_shm(shm_name, WARN, "is full: storing ", tostring(key),
+                 " evicted other entries")
+    end
+    return ...
+  end
+
+  watched = setmetatable({
+    get = function(_, key) return shm:get(key) end,
+    delete = function(_, key) return shm:delete(key) end,
+    set = function(_, key, ...) return check(key, shm:set(key, ...)) end,
+    add = function(_, key, ...) return check(key, shm:add(key, ...)) end,
+    replace = function(_, key, ...) return check(key, shm:replace(key, ...)) end,
+    incr = function(_, key, ...) return check(key, shm:incr(key, ...)) end,
+  }, {
+    __index = function(_, name)
+      local method = shm[name]
+      if type(method) ~= "function" then
+        return method
+      end
+      return function(_, ...)
+        return method(shm, ...)
+      end
+    end,
+  })
+  watched_shms[shm_name] = watched
+  return watched
+end
+
+
 local run_locked
 do
   -- resty_lock is restricted to this scope in order to keep sensitive
@@ -433,6 +557,15 @@ local function fetch_target_list(self)
   local target_list, err = self.shm:get(self.TARGET_LIST)
   if err then
     return nil, "failed to fetch target_list from shm: " .. err
+  end
+
+  if not target_list and self.targets and self.targets[1] then
+    -- every change writes the list, even an empty one: it was evicted, or
+    -- a write that made it longer failed
+    report_shm(self.shm_name, ERR, "no longer has the target list of checker '" ..
+               self.name .. "', for which this worker has " .. #self.targets ..
+               " target(s): it was evicted, or a write of it failed, most " ..
+               "likely because the shm is full")
   end
 
   return target_list and deserialize(target_list) or {}
@@ -1641,7 +1774,7 @@ function _M.new(opts)
   check_valid_type("checks.active.type", self.checks.active.type)
   check_valid_type("checks.passive.type", self.checks.passive.type)
 
-  self.shm = ngx.shared[tostring(opts.shm_name)]
+  self.shm = watched_shm(tostring(opts.shm_name))
   assert(self.shm, ("no shm found by name '%s'"):format(opts.shm_name))
 
   -- load certificate and key
@@ -1932,6 +2065,12 @@ if TESTING then
   -- default CLEANUP_INTERVAL (CHECK_INTERVAL * 25).
   function _M._set_cleanup_interval(interval)
     CLEANUP_INTERVAL = interval
+  end
+
+  -- test-only hook: shorten the window in which only one capacity report is
+  -- logged for a shm
+  function _M._set_shm_report_interval(interval)
+    SHM_REPORT_INTERVAL = interval
   end
 end
 
