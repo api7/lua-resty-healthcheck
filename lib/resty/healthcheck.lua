@@ -26,6 +26,7 @@
 
 local ERR = ngx.ERR
 local WARN = ngx.WARN
+local INFO = ngx.INFO
 local DEBUG = ngx.DEBUG
 local ngx_log = ngx.log
 local tostring = tostring
@@ -38,6 +39,10 @@ local resty_timer = require "resty.timer"
 local bit = require("bit")
 local re_find = ngx.re.find
 local ngx_now = ngx.now
+local ngx_sleep = ngx.sleep
+local ngx_timer_every = ngx.timer.every
+local ngx_worker_exiting = ngx.worker.exiting
+local math_floor = math.floor
 local ngx_worker_id = ngx.worker.id
 local ngx_worker_pid = ngx.worker.pid
 local pcall = pcall
@@ -46,7 +51,11 @@ local type = type
 local assert = assert
 
 
-local RESTY_EVENTS_VER = [[^0\.1\.\d+$]]
+-- Versions of lua-resty-events this library was tested with, as its compat
+-- layer reports them: `0.1.0` up to lua-resty-events 0.2.x, the version of the
+-- library itself from 0.3.0 on.
+local RESTY_EVENTS_VER = [[^0\.[1-3]\.\d+$]]
+local resty_events_version_warned = false
 local RESTY_WORKER_EVENTS_VER = "0.3.3"
 
 
@@ -100,19 +109,32 @@ end
 
 
 local worker_events
+-- whether poll() of the events module dispatches the events that wait: the
+-- one of lua-resty-events only sleeps 2 ms
+local poll_dispatches
 --- This function loads the worker events module received as arg. It will throw
 -- error() if it is not possible to load the module.
 local function load_events_module(self)
   if self.events_module == "resty.worker.events" then
     worker_events = require("resty.worker.events")
+    poll_dispatches = true
     assert(worker_events, "could not load lua-resty-worker-events")
     assert(worker_events._VERSION == RESTY_WORKER_EVENTS_VER,
           "unsupported lua-resty-worker-events version")
 
   elseif self.events_module == "resty.events" then
     worker_events = require("resty.events.compat")
-    local version_match = ngx.re.match(worker_events._VERSION, RESTY_EVENTS_VER, "o")
-    assert(version_match, "unsupported lua-resty-events version")
+    poll_dispatches = false
+    -- another version is used with a warning (once per worker) rather than
+    -- refused: refusing it makes new() fail, which leaves the caller without
+    -- health checks
+    local version = tostring(worker_events._VERSION)
+    if not resty_events_version_warned
+       and not ngx.re.match(version, RESTY_EVENTS_VER, "jo")
+    then
+      resty_events_version_warned = true
+      ngx_log(WARN, "[healthcheck] untested lua-resty-events version: ", version)
+    end
 
   else
     error("unknown events module")
@@ -252,6 +274,130 @@ end
 
 -- resty.lock timeout when yieldable
 local LOCK_TIMEOUT = 5
+
+-- Capacity diagnostics.
+-- A write to a shm that is full first evicts the least recently used entries
+-- to make room, and only says so in its third return value; if that does not
+-- free a large enough block, it fails with "no memory", after the evictions
+-- and after the value the key had before was removed. What is lost can be the
+-- state of another target or the target list of a checker, which then stop
+-- being checked correctly, so this is reported: at most once per
+-- SHM_REPORT_INTERVAL for each shm, in each worker, at each log level, so that
+-- a warning about evictions does not hide an error about a lost list.
+local SHM_REPORT_INTERVAL = 60
+local shm_reports = {}  -- shm name => level => { last = time of the last report, skipped = n }
+
+local function describe_key(key)
+  if key:sub(-12) == ":target_list" then
+    return "a target list"
+  elseif key:find(":state:", 1, true) then
+    return "the state of a target"
+  elseif key:find(":counter:", 1, true) then
+    return "the counter of a target"
+  end
+  return "a key"
+end
+
+
+-- The message is `before`, then the description of `key` if one is given,
+-- then `after`: it is only put together for a report that is logged.
+local function report_shm(shm_name, level, before, key, after)
+  local reports = shm_reports[shm_name]
+  if not reports then
+    reports = {}
+    shm_reports[shm_name] = reports
+  end
+  local report = reports[level]
+  if not report then
+    report = { skipped = 0 }
+    reports[level] = report
+  end
+
+  local now = ngx_now()
+  local since = report.last and now - report.last
+  -- a clock that was set back does not silence the reports
+  if since and since >= 0 and since < SHM_REPORT_INTERVAL then
+    report.skipped = report.skipped + 1
+    return
+  end
+
+  local skipped = report.skipped
+  report.last, report.skipped = now, 0
+  ngx_log(level, LOG_PREFIX, "shm '", shm_name, "' ", before,
+          key and (describe_key(key) .. " ('" .. key .. "')") or "", after or "",
+          ". This shm holds the target list of each checker and the state of ",
+          "each target, and one that is lost stops being checked correctly: ",
+          "increase the size of this lua_shared_dict",
+          skipped > 0 and (" (" .. skipped .. " more report(s) like this were " ..
+                           "skipped since the last one)") or "")
+end
+
+
+local FAILED = " could not be stored, and the value it had before, if any, is gone"
+local FAILED_EVICTED = " could not be stored, other entries were evicted trying, " ..
+                       "and the value it had before, if any, is gone"
+local FAILED_MAYBE_EVICTED = " could not be stored, other entries may have been " ..
+                             "evicted trying, and the value it had before, if any, is gone"
+
+
+-- Returns the shm `shm_name` wrapped so that every write is checked: a write
+-- that evicted other entries, or that failed for lack of memory, is reported.
+-- Everything else is passed through.
+local watched_shms = {}
+
+local function watched_shm(shm_name)
+  local watched = watched_shms[shm_name]
+  if watched then
+    return watched
+  end
+
+  local shm = ngx.shared[shm_name]
+  if not shm then
+    return nil
+  end
+
+  -- returns what the write returned, unchanged
+  local function check(key, ...)
+    local ok, err, forcible = ...
+    if not ok and err == "no memory" then
+      -- the shm evicts entries before it gives up, so `forcible` can be set
+      -- here as well; and it removes the value the key had before it tries
+      -- to store the new one
+      -- incr() does not return `forcible` when it fails, although it evicts
+      -- entries like the others
+      report_shm(shm_name, ERR, "is full: ", tostring(key),
+                 forcible and FAILED_EVICTED
+                 or forcible == nil and FAILED_MAYBE_EVICTED
+                 or FAILED)
+    elseif forcible then
+      report_shm(shm_name, WARN, "is full: storing ", tostring(key),
+                 " evicted other entries")
+    end
+    return ...
+  end
+
+  watched = setmetatable({
+    get = function(_, key) return shm:get(key) end,
+    delete = function(_, key) return shm:delete(key) end,
+    set = function(_, key, ...) return check(key, shm:set(key, ...)) end,
+    add = function(_, key, ...) return check(key, shm:add(key, ...)) end,
+    replace = function(_, key, ...) return check(key, shm:replace(key, ...)) end,
+    incr = function(_, key, ...) return check(key, shm:incr(key, ...)) end,
+  }, {
+    __index = function(_, name)
+      local method = shm[name]
+      if type(method) ~= "function" then
+        return method
+      end
+      return function(_, ...)
+        return method(shm, ...)
+      end
+    end,
+  })
+  watched_shms[shm_name] = watched
+  return watched
+end
+
 
 local run_locked
 do
@@ -435,6 +581,15 @@ local function fetch_target_list(self)
     return nil, "failed to fetch target_list from shm: " .. err
   end
 
+  if not target_list and self.targets and self.targets[1] then
+    -- every change writes the list, even an empty one: it was evicted, or
+    -- a write that made it longer failed
+    report_shm(self.shm_name, ERR, "no longer has the target list of checker '" ..
+               self.name .. "', for which this worker has " .. #self.targets ..
+               " target(s): it was evicted, or a write of it failed, most " ..
+               "likely because the shm is full")
+  end
+
   return target_list and deserialize(target_list) or {}
 end
 
@@ -509,8 +664,6 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
         end
         target.purge_time = nil
         found = true
-        internal_health = self:get_target_status(ip, port, hostname) and
-                          "healthy" or "unhealthy"
         break
       end
     end
@@ -518,10 +671,35 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
     -- we first add the internal health, and only then the updated list.
     -- this prevents a state where a target is in the list, but does not
     -- have a key in the shm.
-    local ok, err = self.shm:set(key_for(self.TARGET_STATE, ip, port, hostname),
-                                 INTERNAL_STATES[internal_health])
+    -- A target re-added inside the purge window keeps the state it has in
+    -- shm: probes and reports write it under the target lock, so it must not
+    -- be overwritten here from this worker's copy, which may be older. Only a
+    -- missing state (evicted from a full shm) is filled in, with the status
+    -- this worker has for the target if it has one.
+    local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
+    local ok, err
+    local state_filled = false
+    if found then
+      local known = get_target(self, ip, port, hostname)
+      if known and known.internal_health then
+        internal_health = known.internal_health
+      end
+      ok, err = self.shm:add(state_key, INTERNAL_STATES[internal_health])
+      if ok then
+        state_filled = true
+      elseif err == "exists" then
+        ok, err = true, nil
+      end
+    else
+      -- a new target counts from zero: a report made for it after an earlier
+      -- removal, by a worker whose copy still had it, can have left a counter
+      self.shm:delete(key_for(self.TARGET_COUNTER, ip, port, hostname))
+      ok, err = self.shm:set(state_key, INTERNAL_STATES[internal_health])
+    end
     if not ok then
-      self:log(ERR, "failed to set initial health status in shm: ", err)
+      -- a checker created later would load a listed target without a state
+      -- as having no status: do not publish it
+      return nil, "failed to set initial health status in shm: " .. err
     end
 
     -- target does not exist, go add it
@@ -538,11 +716,15 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
 
     ok, err = self.shm:set(self.TARGET_LIST, target_list)
     if not ok then
+      if not found then
+        -- leave no state behind for a target that is not listed
+        self.shm:delete(state_key)
+      end
       return nil, "failed to store target_list in shm: " .. err
     end
 
-    -- raise event for our newly added target
-    if not found then
+    -- raise event for our newly added target, or for the state filled in
+    if not found or state_filled then
       self:raise_event(self.events[internal_health], ip, port, hostname)
     end
 
@@ -645,7 +827,14 @@ function checker:clear()
       clear_target_data_from_shm(self, ip, port, hostname)
     end
 
+    -- this worker's copy is emptied here, not by the event below
+    if next(self.targets) then
+      self.status_ver = self.status_ver + 1
+    end
     self.targets = {}
+    -- the members of the copy changed without an event: they are compared
+    -- with the list next time, even if the list is the one last compared
+    self.membership_changed = true
 
     -- raise event for our removed target
     self:raise_event(self.events.clear)
@@ -735,6 +924,65 @@ local function ctr_get(multictr, idx)
 end
 
 
+-- Tells whether a target is in the target list in shm, which decides
+-- membership. Every change writes the list, so a missing list was evicted
+-- from a full shm: membership is then unknown.
+-- @return `"listed"`, `"unlisted"` or `"unknown"`, or `nil + error`.
+local function target_membership(self, ip, port, hostname)
+  local raw, err = self.shm:get(self.TARGET_LIST)
+  if err then
+    return nil, "failed to fetch target_list from shm: " .. err
+  end
+  if raw == nil then
+    return "unknown"
+  end
+  for _, target in ipairs(deserialize(raw)) do
+    if target.ip == ip and target.port == port
+       and (target.hostname or target.ip) == hostname
+    then
+      return "listed"
+    end
+  end
+  return "unlisted"
+end
+
+
+-- Writes the state of an existing target. A target that another worker
+-- removed meanwhile gets no state written: this worker's copy still has it,
+-- but a state written for it, and the event that follows, would bring it back
+-- in the workers that already removed it.
+-- @return `true` when written, `false` when the target was removed, or
+-- `nil + error`.
+local function write_target_state(self, ip, port, hostname, state)
+  local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
+  local ok, err = self.shm:replace(state_key, INTERNAL_STATES[state])
+  if ok then
+    return true
+  end
+  if err ~= "not found" then
+    return nil, err
+  end
+
+  -- no state: the target was removed, or its state key was evicted from a
+  -- full shm while it is still listed, and then it is written again. It is
+  -- also written when the list itself was evicted and nothing tells whether
+  -- the target is listed, as before, so that health changes keep working.
+  local membership, list_err = target_membership(self, ip, port, hostname)
+  if not membership then
+    return nil, list_err
+  end
+  if membership == "unlisted" then
+    return false
+  end
+
+  ok, err = self.shm:set(state_key, INTERNAL_STATES[state])
+  if not ok then
+    return nil, err
+  end
+  return true
+end
+
+
 -- Increment the healthy or unhealthy counter. If the threshold of occurrences
 -- is reached, it changes the status of the target in the shm and posts an
 -- event.
@@ -805,9 +1053,25 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
     end
 
     if new_health and new_health ~= current_health then
-      local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
-      self.shm:set(state_key, INTERNAL_STATES[new_health])
+      local written, write_err = write_target_state(self, ip, port, hostname, new_health)
+      if written == false then
+        -- removed meanwhile by another worker: nothing is left to count
+        self.shm:delete(counter_key)
+        self:log(DEBUG, "not changing the state of a target that was removed: ",
+                        hostname, " ", ip, ":", port)
+        return true
+      end
+
+      if written == nil then
+        -- e.g. the shm is full. The other workers are told anyway, as they
+        -- were before: the target did reach its threshold.
+        self:log(ERR, "failed to write state '", new_health, "' of ", hostname,
+                      " ", ip, ":", port, " to shm: ", write_err)
+      end
       self:raise_event(self.events[new_health], ip, port, hostname)
+      if written == nil then
+        return nil, write_err
+      end
     end
 
     return true
@@ -991,29 +1255,40 @@ function checker:set_target_status(ip, port, hostname, is_healthy)
   end
 
   local counter_key = key_for(self.TARGET_COUNTER, ip, port, hostname)
-  local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
 
   local ok, err = locking_target(self, ip, port, hostname, function()
 
-    local _, err = self.shm:set(counter_key, 0)
-    if err then
-      return nil, err
+    local written, write_err = write_target_state(self, ip, port, hostname, health_report)
+    if written == false then
+      -- removed meanwhile by another worker
+      self:log(DEBUG, "not setting the status of a target that was removed: ",
+                      hostname, " ", ip, ":", port)
+      return true
     end
 
-    self.shm:set(state_key, INTERNAL_STATES[health_report])
-    if err then
-      return nil, err
+    if written == nil then
+      -- e.g. the shm is full. The other workers are told anyway, as they
+      -- were before.
+      self:log(ERR, "failed to write state '", health_report, "' of ", hostname,
+                    " ", ip, ":", port, " to shm: ", write_err)
     end
 
+    -- announce the change before anything else can fail
     self:raise_event(self.events[health_report], ip, port, hostname)
+    self:log(WARN, health_report, " forced for ", hostname, " ", ip, ":", port)
+
+    local _, err = self.shm:set(counter_key, 0)
+    if written == nil then
+      return nil, write_err
+    end
+    if err then
+      return nil, err
+    end
 
     return true
 
   end)
 
-  if ok then
-    self:log(WARN, health_report, " forced for ", hostname, " ", ip, ":", port)
-  end
   return ok, err
 end
 
@@ -1310,7 +1585,13 @@ local function checker_callback(self, health_mode)
   end
 end
 
--- Event handler callback
+-- Event handler callback.
+-- `status_ver` is bumped whenever the answer of `get_target_status()` changes
+-- for a target: its health moves between the healthy and the unhealthy side,
+-- or the target appears in, or disappears from, this worker's copy. Callers
+-- that cache what they derive from the targets' statuses use it as the cache
+-- version; for them an unknown target is not the same as an unhealthy one
+-- (Apache APISIX treats it as usable).
 function checker:event_handler(event_name, ip, port, hostname)
 
   local target_found = get_target(self, ip, port, hostname)
@@ -1335,6 +1616,8 @@ function checker:event_handler(event_name, ip, port, hostname)
           break
         end
       end
+      self.status_ver = self.status_ver + 1
+      self.membership_changed = true
       self:log(DEBUG, "event: target '", hostname or "", " (", ip, ":", port,
                       ")' removed")
 
@@ -1348,13 +1631,15 @@ function checker:event_handler(event_name, ip, port, hostname)
          event_name == self.events.unhealthy or
          event_name == self.events.mostly_unhealthy
          then
-    if not target_found then
+    local is_new = not target_found
+    if is_new then
       -- it is a new target, must add it first
       target_found = { ip = ip, port = port, hostname = hostname or ip }
       self.targets[target_found.ip] = self.targets[target_found.ip] or {}
       self.targets[target_found.ip][target_found.port] = self.targets[target_found.ip][target_found.port] or {}
       self.targets[target_found.ip][target_found.port][target_found.hostname] = target_found
       self.targets[#self.targets + 1] = target_found
+      self.membership_changed = true
       self:log(DEBUG, "event: target added '", hostname or "", "(", ip, ":", port, ")'")
     end
     do
@@ -1363,7 +1648,8 @@ function checker:event_handler(event_name, ip, port, hostname)
       local from = from_status == "healthy" or from_status == "mostly_healthy"
       local to = to_status == "healthy" or to_status == "mostly_healthy"
 
-      if from ~= to then
+      -- a new target was unknown until now, whatever its state
+      if from ~= to or is_new then
         self.status_ver = self.status_ver + 1
       end
 
@@ -1374,11 +1660,719 @@ function checker:event_handler(event_name, ip, port, hostname)
 
   elseif event_name == self.events.clear then
     -- clear local cache
+    if next(self.targets) then
+      self.status_ver = self.status_ver + 1
+    end
     self.targets = {}
+    self.membership_changed = true
     self:log(DEBUG, "event: local cache cleared")
 
   else
     self:log(WARN, "event: unknown event received '", event_name, "'")
+  end
+end
+
+
+------------------------------------------------------------------------------
+-- Reconciling the copy of each worker with shm.
+--
+-- A worker's copy of the targets is kept up to date by events. An event that
+-- does not arrive (lost in transport, or dispatched before the checker
+-- subscribed) leaves the copy wrong until the same target changes again.
+--
+-- So every change is numbered: `raise_event()` increments a version of the
+-- checker and a version shared by all checkers of the shm, both kept in the
+-- shm, after the change itself was written, and sends the two numbers along
+-- with the event. A worker that got every event knows the versions the shm
+-- must have, and a timer compares them in every worker (see `reconcile`):
+--
+-- * one read per shm when nothing is missing, however many checkers and
+--   changes there are;
+-- * when the shm is ahead, and still is after EVENT_GRACE (the events may be
+--   on their way), the version of each checker is read, and the checkers
+--   that are behind are compared with shm, target by target;
+-- * in the background, every checker is also compared in turn whatever the
+--   versions say, SWEEP_UNITS of work per run, and not more than once in
+--   SWEEP_ROUND_TICKS runs. That repairs what versions cannot tell: a version
+--   key evicted from a full shm, or changes made during a reload by workers
+--   that still run an older version of this module.
+--
+-- A comparison yields after every SYNC_BATCH units of work, and only one runs
+-- at a time in a worker. While a checker is being compared, the events for it
+-- are kept and applied when the comparison is done.
+--
+-- A comparison covers the changes up to the version it read first, so their
+-- events are ignored when they come late: `version_applied`. That only holds
+-- when shm told everything. When the state key of a listed target, or the
+-- list, was evicted from a full shm, the events are the only source left:
+-- `version_applied` is unset, every event is applied and followed by a
+-- comparison, until one reads everything again. Each target also keeps the
+-- version of the last change the copy took for it (`target.version`), so that
+-- an event that is older than that does not put an old status back.
+------------------------------------------------------------------------------
+
+local RECONCILE_INTERVAL = CHECK_INTERVAL
+-- how long the events of the latest changes get to arrive, before the shm
+-- being ahead is taken for a lost event
+local EVENT_GRACE = 0.005
+-- work between two yields, in units of one status comparison (a key, a shm
+-- read: about 0.5 microseconds, a few times that on data that is not cached)
+local SYNC_BATCH = 1000
+-- the background comparison: work per run of the timer, and the least number
+-- of runs between two comparisons of the same checker (10 s). With many
+-- targets a round takes longer: (targets + 2 * checkers) / SWEEP_UNITS runs.
+local SWEEP_UNITS = 20
+local SWEEP_ROUND_TICKS = 100
+local SYNC_COST_LISTED = 3     -- a listed target, in a comparison of the members
+local SYNC_COST_CHECKER = 2    -- a checker: its version and its list are read
+local MAX_QUEUED_EVENTS = 1000
+local MAX_AHEAD = 128
+-- an event this far behind the version of the copy is not a late one
+local STALE_VERSION_GAP = 1000
+-- a comparison that keeps failing is logged this often
+local SYNC_ERROR_LOG_INTERVAL = 60
+local SHM_VERSION_KEY = SHM_PREFIX .. ":shm_version"
+local WEAK_KEYS = { __mode = "k" }
+
+local reconcile_timer
+local reconciling = false
+local reconcile_again = false
+local reconcile_tick = 0
+local sync_seq = 0
+-- checkers to compare with shm on the next run
+local resync_pending = setmetatable({}, WEAK_KEYS)
+-- every checker of the worker, in an array that can be walked in pieces: a
+-- checker that was collected leaves a hole, closed by `compact_checkers`
+local checkers = setmetatable({}, { __mode = "v" })
+local checkers_n = 0
+-- the background comparison: where it is, what it owes, when the round began
+local sweep_pos = 0
+local sweep_debt = 0
+local sweep_holes = 0
+local sweep_round_tick = 0
+-- shm name => what this worker knows of its version; and the same in an
+-- array, which the timer can walk while it yields
+local shm_versions = {}
+local shm_trackers = {}
+-- events modules in which `shm_event` is registered
+local shm_event_registered = setmetatable({}, WEAK_KEYS)
+-- counters, for tests and benchmarks
+local reconcile_stats = { runs = 0, scans = 0, compared = 0, members = 0,
+                          corrected = 0, yields = 0, queued = 0 }
+
+
+-- A version key that does not exist starts from the time in ms, so that one
+-- that was evicted from a full shm does not come back to a value a worker has
+-- already seen.
+local function version_init()
+  return math_floor(ngx_now() * 1000)
+end
+
+
+-- Increments the version of the checker and of its shm. Callers write the
+-- change to shm first, so a version always announces data that can be read.
+-- @return the two new versions; either is `nil` when it could not be written.
+local function bump_versions(self)
+  local init = version_init()
+  local version, err = self.shm:incr(self.TARGET_VERSION, 1, init)
+  if not version then
+    self:log(WARN, "failed to increment the target version: ", err)
+  end
+
+  local shm_version
+  shm_version, err = self.shm:incr(SHM_VERSION_KEY, 1, init)
+  if not shm_version then
+    self:log(WARN, "failed to increment the version of the shm: ", err)
+  end
+
+  return version, shm_version
+end
+
+
+-- Sets the shm version this worker has accounted for, keeping the events
+-- that arrived ahead of it.
+local function shm_version_set(tracker, version)
+  tracker.expected = version
+  if tracker.n_ahead == 0 then
+    return
+  end
+
+  local ahead, n = tracker.ahead, 0
+  for seen in pairs(ahead) do
+    if version and seen > version then
+      n = n + 1
+    else
+      ahead[seen] = nil
+    end
+  end
+  if version then
+    while ahead[version + 1] do
+      version = version + 1
+      ahead[version] = nil
+      n = n - 1
+    end
+    tracker.expected = version
+  end
+  tracker.n_ahead = n
+end
+
+
+-- Called for every event of this worker: counts the changes announced in each
+-- shm, from all checkers, including those this worker has no checker for.
+-- When they are all accounted for, the timer has nothing to look at.
+local function shm_event(data)
+  local shm_version = type(data) == "table" and data.shm_version
+  if not shm_version then
+    return
+  end
+  local tracker = shm_versions[data.shm]
+  if not tracker then
+    return
+  end
+
+  local expected = tracker.expected
+  if expected then
+    if shm_version <= expected then
+      return
+    end
+    if shm_version == expected + 1 and tracker.n_ahead == 0 then
+      tracker.expected = shm_version
+      return
+    end
+  end
+
+  -- an earlier event is late or lost: remember this one, in case it is late
+  if tracker.n_ahead >= MAX_AHEAD then
+    -- too many: the next run of the timer looks at every checker
+    tracker.ahead, tracker.n_ahead, tracker.expected = {}, 0, false
+    return
+  end
+  if not tracker.ahead[shm_version] then
+    tracker.ahead[shm_version] = true
+    tracker.n_ahead = tracker.n_ahead + 1
+  end
+  if expected then
+    shm_version_set(tracker, expected)
+  end
+end
+
+
+-- Starts counting the changes of the shm of a checker, once per shm.
+local function track_shm_version(self)
+  if not shm_event_registered[worker_events] then
+    shm_event_registered[worker_events] = true
+    worker_events.register(shm_event)
+  end
+
+  if not shm_versions[self.shm_name] then
+    self.shm:add(SHM_VERSION_KEY, version_init())
+    -- read after subscribing: an event dispatched before that is included
+    local tracker = {
+      name = self.shm_name,
+      shm = self.shm,
+      expected = self.shm:get(SHM_VERSION_KEY),
+      ahead = {},
+      n_ahead = 0,
+    }
+    shm_versions[self.shm_name] = tracker
+    shm_trackers[#shm_trackers + 1] = tracker
+  end
+end
+
+
+-- Handles an event of a checker.
+local function on_event(self, event, data)
+  if data.shm and data.shm ~= self.shm_name then
+    -- from the checker that has this name in another shm: the source of an
+    -- event only has the name
+    return
+  end
+
+  if self.syncing then
+    -- applied when the comparison with shm is done
+    local queue = self.event_queue
+    if not queue then
+      queue = {}
+      self.event_queue = queue
+    end
+    local n = #queue
+    if n >= MAX_QUEUED_EVENTS * 2 then
+      self.event_queue_overflow = true
+    else
+      queue[n + 1], queue[n + 2] = event, data
+      reconcile_stats.queued = reconcile_stats.queued + 1
+    end
+    return
+  end
+
+  if not self.targets then
+    -- the initial load was deferred to a timer and has not run yet
+    resync_pending[self] = true
+    return
+  end
+
+  local version = data.version
+  if version then
+    local applied = self.version_applied
+    if applied then
+      if version <= applied then
+        -- a comparison with shm already covered this change. An event that
+        -- is far behind is not a late one: the version key was made again
+        -- from an earlier time (evicted, and the clock set back), so what
+        -- this worker counted means nothing, and the checker is compared.
+        if applied - version > STALE_VERSION_GAP then
+          resync_pending[self] = true
+        end
+        return
+      end
+      if version == applied + 1 then
+        self.version_applied = version
+      else
+        -- an earlier event is late or lost: this one is applied as it comes,
+        -- and the next run of the timer compares the checker with shm
+        resync_pending[self] = true
+      end
+    else
+      -- the last comparison could not read everything from shm (or there is
+      -- no version to go by): what it missed may be in this event
+      resync_pending[self] = true
+    end
+
+    local ip = data.ip
+    if ip then
+      -- The changes of one target are applied in their order: an event that
+      -- is older than what the copy has for the target, from a later event
+      -- or from shm, would put an old status back.
+      local port, hostname = data.port, data.hostname
+      local target = get_target(self, ip, port, hostname)
+      local seen = target and target.version
+      if seen and version <= seen then
+        return
+      end
+
+      self:event_handler(event, ip, port, hostname)
+
+      target = target or get_target(self, ip, port, hostname)
+      if target then
+        target.version = version
+      end
+      return
+    end
+  end
+  -- an event without a version comes from a worker that runs an older version
+  -- of this module, during a reload: it is applied as it always was
+
+  return self:event_handler(event, data.ip, data.port, data.hostname)
+end
+
+
+-- Counts `units` of work, and yields when SYNC_BATCH of them are done.
+-- @return `true` when it yielded.
+local function sync_spend(budget, units)
+  local left = budget.left - units
+  if left > 0 then
+    budget.left = left
+    return false
+  end
+
+  budget.left = SYNC_BATCH
+  reconcile_stats.yields = reconcile_stats.yields + 1
+  ngx_sleep(0)
+  return true
+end
+
+
+-- A target whose state could not be read from shm in a comparison at
+-- `version`: what the copy has for it stays, and so does the version of it,
+-- unless that is from before the version key was made again from an earlier
+-- time (see STALE_VERSION_GAP), when it would keep later events out. When the
+-- version key itself is gone, nothing tells whether it will be made again
+-- from an earlier time: the version of the target is dropped, and an older
+-- event of it that arrives after that is applied.
+local function sync_unread(target, version)
+  local seen = target.version
+  if seen and (not version or seen > version) then
+    target.version = version
+  end
+end
+
+
+-- The body of `sync_from_shm`: see there. `self.syncing` is set, so the copy
+-- only changes here, or under `clear()` and `stop()`, which end the pass.
+-- `version` is the version of the checker that was read before anything else.
+-- @return the number of corrections, and whether shm told everything (`false`
+-- when the list, or the state of a listed target, was not there); or `false`
+-- when the pass was cut short.
+local function sync_targets(self, budget, raw, members, version)
+  local shm, events = self.shm, self.events
+  local targets = self.targets
+  local state_prefix = self.TARGET_STATE
+  local corrected = 0
+  -- Without a list nothing tells which targets are listed. A checker that
+  -- has no target either has nothing to compare, unless a change was
+  -- announced since this copy was last in step: every change writes the
+  -- list, so it was there and is gone.
+  local covered = raw ~= nil or (targets[1] == nil and version == self.version_applied)
+
+  if not members then
+    -- same members as when they were last compared: only the statuses
+    local i = 1
+    local target = targets[1]
+    while target do
+      local state = INTERNAL_STATES[shm:get(key_for(state_prefix, target.ip, target.port,
+                                                    target.hostname))]
+      if state then
+        if state ~= target.internal_health then
+          self:event_handler(events[state], target.ip, target.port, target.hostname)
+          corrected = corrected + 1
+        end
+        target.version = version
+      else
+        -- a state key evicted from a full shm tells nothing: the copy is kept
+        covered = false
+        sync_unread(target, version)
+      end
+      if sync_spend(budget, 1) and (self.targets ~= targets or self.stopped) then
+        return false
+      end
+      i = i + 1
+      target = targets[i]
+    end
+    return corrected, covered
+  end
+
+  local list = deserialize(raw)
+  local listed = #list
+  -- decoding is one step that cannot be split: it is paid for afterwards
+  if sync_spend(budget, listed) and (self.targets ~= targets or self.stopped) then
+    return false
+  end
+
+  sync_seq = sync_seq + 1
+  local mark = sync_seq
+  local complete = true
+  for i = 1, listed do
+    local entry = list[i]
+    local ip, port, hostname = entry.ip, entry.port, entry.hostname or entry.ip
+    local state = INTERNAL_STATES[shm:get(key_for(state_prefix, ip, port, hostname))]
+    local target = get_target(self, ip, port, hostname)
+    if state then
+      if not target or target.internal_health ~= state then
+        self:event_handler(events[state], ip, port, hostname)
+        corrected = corrected + 1
+        target = target or get_target(self, ip, port, hostname)
+      end
+      if target then
+        target.version = version
+      end
+    else
+      covered = false
+      if target then
+        sync_unread(target, version)
+      else
+        -- listed, but its state key was evicted: it cannot be added without
+        -- a status, so the members are compared again next time
+        complete = false
+      end
+    end
+    if target then
+      target.sync_mark = mark
+    end
+    if sync_spend(budget, SYNC_COST_LISTED) and (self.targets ~= targets or self.stopped) then
+      return false
+    end
+  end
+
+  -- the targets that are not listed any more, removed in one pass
+  local count, kept = #targets, 0
+  for i = 1, count do
+    local target = targets[i]
+    if target.sync_mark == mark then
+      kept = kept + 1
+      targets[kept] = target
+    else
+      local by_port = targets[target.ip]
+      local by_hostname = by_port[target.port]
+      by_hostname[target.hostname or target.ip] = nil
+      if not next(by_hostname) then
+        by_port[target.port] = nil
+      end
+      if not next(by_port) then
+        targets[target.ip] = nil
+      end
+    end
+  end
+  for i = kept + 1, count do
+    targets[i] = nil
+  end
+  if kept < count then
+    -- callers treat a target they don't know as usable: the routing view
+    -- changed
+    self.status_ver = self.status_ver + 1
+    corrected = corrected + count - kept
+  end
+
+  -- from here on, a comparison of the statuses is enough until the list or
+  -- the members of the copy change
+  self.membership_changed = nil
+  self.synced_list = complete and raw or nil
+  sync_spend(budget, count / 8)
+
+  return corrected, covered
+end
+
+
+-- Compares the copy this worker has of the targets of a checker with shm, and
+-- corrects it: targets missing from the copy are added, targets that are no
+-- longer listed are removed, statuses are taken from shm, and `status_ver` is
+-- incremented when the routing view changed (as `event_handler` does).
+-- Must run where it can yield.
+-- @return the number of corrections; `false` when the pass was cut short and
+-- is to be done again; or `nil + error`.
+local function sync_from_shm(self, budget)
+  if not self.targets then
+    -- the initial load was deferred to a timer and has not run yet
+    resync_pending[self] = true
+    return false
+  end
+
+  local shm = self.shm
+  -- read first: every change up to this version is in what is read after it
+  local version = shm:get(self.TARGET_VERSION)
+  local raw, err = shm:get(self.TARGET_LIST)
+  if err then
+    return nil, "failed to fetch target_list from shm: " .. err
+  end
+
+  -- every change writes the list, so a missing list was evicted from a full
+  -- shm (or the checker never had a target): nothing tells which targets are
+  -- listed, and only the statuses are compared
+  local members = raw ~= nil and (raw ~= self.synced_list or self.membership_changed)
+  reconcile_stats.compared = reconcile_stats.compared + 1
+  if members then
+    reconcile_stats.members = reconcile_stats.members + 1
+  end
+
+  self.syncing = true
+  local ok, corrected, covered = pcall(sync_targets, self, budget, raw, members, version)
+  self.syncing = nil
+
+  if ok and corrected then
+    -- What shm could not tell may still come in an event that is late: only
+    -- a comparison that read everything covers the changes up to its
+    -- version. After any other, every event is applied and followed by a
+    -- comparison (see `on_event`).
+    self.version_applied = covered and version or nil
+    -- The version this copy was last compared at, also when shm could not
+    -- tell everything: the scan of the timer goes by it then, so that a
+    -- change of another checker does not have this one compared again.
+    self.version_compared = version
+  end
+
+  -- the events that arrived meanwhile
+  local queue = self.event_queue
+  if queue then
+    self.event_queue = nil
+    for i = 1, #queue, 2 do
+      on_event(self, queue[i], queue[i + 1])
+    end
+  end
+  if self.event_queue_overflow then
+    self.event_queue_overflow = nil
+    resync_pending[self] = true
+  end
+
+  if not ok then
+    return nil, corrected
+  end
+  if not corrected then
+    if not self.stopped then
+      resync_pending[self] = true
+    end
+    return false
+  end
+
+  if corrected > 0 then
+    reconcile_stats.corrected = reconcile_stats.corrected + corrected
+    -- also expected when the timer runs between a change and its event
+    self:log(INFO, "reconciled ", corrected, " target(s) with shm")
+  end
+  return corrected
+end
+
+
+-- Closes the holes that collected checkers left in `checkers`. Only called
+-- by the timer when it is not walking the array.
+local function compact_checkers()
+  local kept = 0
+  for i = 1, checkers_n do
+    local checker_obj = checkers[i]
+    if checker_obj then
+      kept = kept + 1
+      if kept ~= i then
+        checkers[kept] = checker_obj
+        checkers[i] = nil
+      end
+    end
+  end
+  checkers_n = kept
+end
+
+
+-- The background comparison: marks the next checkers in turn, for
+-- SWEEP_UNITS of work per run of the timer.
+local function sweep()
+  if sweep_pos == 0 then
+    -- between two rounds
+    if reconcile_tick < sweep_round_tick + SWEEP_ROUND_TICKS then
+      return
+    end
+    sweep_round_tick = reconcile_tick
+    sweep_debt = 0
+    if sweep_holes * 4 > checkers_n then
+      compact_checkers()
+    end
+    sweep_holes = 0
+  end
+
+  sweep_debt = sweep_debt - SWEEP_UNITS
+  -- at most this many slots are looked at, so that a run of holes or of
+  -- stopped checkers costs no more than the work it replaces
+  local slots = SWEEP_UNITS
+  while sweep_debt < 0 and slots > 0 do
+    sweep_pos = sweep_pos + 1
+    if sweep_pos > checkers_n then
+      -- the round is done
+      sweep_pos = 0
+      return
+    end
+    slots = slots - 1
+    local checker_obj = checkers[sweep_pos]
+    if not checker_obj then
+      sweep_holes = sweep_holes + 1
+    elseif not checker_obj.stopped then
+      resync_pending[checker_obj] = true
+      sweep_debt = sweep_debt + SYNC_COST_CHECKER
+                   + (checker_obj.targets and #checker_obj.targets or 0)
+    end
+  end
+end
+
+
+-- One run of the timer, see the top of this section.
+local function run_reconcile()
+  local budget = { left = SYNC_BATCH }
+
+  repeat
+    reconcile_again = false
+    reconcile_tick = reconcile_tick + 1
+    reconcile_stats.runs = reconcile_stats.runs + 1
+
+    sweep()
+
+    -- was anything announced in a shm that did not arrive here as an event?
+    for t = 1, #shm_trackers do
+      local tracker = shm_trackers[t]
+      local shm_name = tracker.name
+      local version = tracker.shm:get(SHM_VERSION_KEY)
+      local expected = tracker.expected
+      if version ~= expected then
+        local missed = true
+        if version and expected and version > expected then
+          -- the shm is ahead: the events may be on their way. With
+          -- lua-resty-worker-events they wait in its shm for the next poll:
+          -- they are dispatched now.
+          if poll_dispatches then
+            pcall(worker_events.poll)
+            expected = tracker.expected
+          end
+          if not (expected and expected >= version) then
+            ngx_sleep(EVENT_GRACE)
+            expected = tracker.expected
+          end
+          missed = not (expected and expected >= version)
+        end
+        -- (otherwise the version key was evicted from a full shm, and maybe
+        -- made again: nothing tells what happened meanwhile)
+
+        if missed then
+          reconcile_stats.scans = reconcile_stats.scans + 1
+          -- what is announced from here on is counted on top of this
+          shm_version_set(tracker, tracker.shm:get(SHM_VERSION_KEY))
+
+          -- checkers created meanwhile are up to date
+          for i = 1, checkers_n do
+            local checker_obj = checkers[i]
+            if checker_obj and checker_obj.shm_name == shm_name and not checker_obj.stopped
+               and checker_obj.shm:get(checker_obj.TARGET_VERSION)
+                   ~= (checker_obj.version_applied or checker_obj.version_compared)
+            then
+              resync_pending[checker_obj] = true
+            end
+            sync_spend(budget, 1)
+          end
+        end
+      end
+    end
+
+    if next(resync_pending) then
+      -- a copy: the loop below yields, and checkers are added meanwhile
+      local list, n = {}, 0
+      for checker_obj in pairs(resync_pending) do
+        n = n + 1
+        list[n] = checker_obj
+      end
+      resync_pending = setmetatable({}, WEAK_KEYS)
+
+      for i = 1, n do
+        local checker_obj = list[i]
+        list[i] = false
+        if not checker_obj.stopped then
+          -- an error is kept from ending the run: the other checkers are
+          -- still compared
+          local pok, ok, err = pcall(sync_from_shm, checker_obj, budget)
+          if not pok then
+            ok, err = nil, ok
+          end
+          if ok == nil then
+            -- tried again on the next run of the timer
+            resync_pending[checker_obj] = true
+            local now = ngx_now()
+            local last = checker_obj.sync_error_logged
+            if not last or now < last or now - last >= SYNC_ERROR_LOG_INTERVAL then
+              checker_obj.sync_error_logged = now
+              checker_obj:log(ERR, "failed to reconcile targets with shm (it is tried ",
+                                   "again on every run of the timer): ", err)
+            end
+          elseif checker_obj.sync_error_logged then
+            -- a failure after this one is a new one
+            checker_obj.sync_error_logged = nil
+          end
+          sync_spend(budget, SYNC_COST_CHECKER)
+        end
+      end
+    end
+  until not reconcile_again or ngx_worker_exiting()
+end
+
+
+-- The timer of each worker, every RECONCILE_INTERVAL.
+local function reconcile(premature)
+  if premature then
+    return
+  end
+  if reconciling then
+    -- the previous run is not done: it yields while it works. It goes
+    -- around once more when it is, so that nothing runs twice at a time.
+    reconcile_again = true
+    return
+  end
+
+  reconciling = true
+  local ok, err = pcall(run_reconcile)
+  reconciling = false
+  if not ok then
+    ngx_log(ERR, LOG_PREFIX, "failed to reconcile targets with shm: ", err)
   end
 end
 
@@ -1395,9 +2389,21 @@ function checker:log(level, ...)
 end
 
 
--- Raises an event for a target status change.
+-- Raises an event for a change of the targets: a status, a target added or
+-- removed, all of them cleared. The change is numbered (see `bump_versions`),
+-- and the numbers go with the event.
 function checker:raise_event(event_name, ip, port, hostname)
-  local target = { ip = ip, port = port, hostname = hostname }
+  local version, shm_version = bump_versions(self)
+  local target = {
+    ip = ip,
+    port = port,
+    hostname = hostname,
+    version = version,
+    shm_version = shm_version,
+    shm = self.shm_name,
+  }
+  -- Not counted here for this worker: its own event can be lost as well, and
+  -- its copy is only changed by the event.
   worker_events.post(self.EVENT_SOURCE, event_name, target)
 end
 
@@ -1410,6 +2416,8 @@ function checker:stop()
   self.checks.active.healthy.active = false
   self.checks.active.unhealthy.active = false
   worker_events.unregister(self.ev_callback, self.EVENT_SOURCE)
+  -- not reconciled with shm while it gets no events
+  self.stopped = true
   self:log(DEBUG, "healthchecker stopped")
   return true
 end
@@ -1431,6 +2439,13 @@ function checker:start()
 
   worker_events.unregister(self.ev_callback, self.EVENT_SOURCE)  -- ensure we never double subscribe
   worker_events.register_weak(self.ev_callback, self.EVENT_SOURCE)
+
+  if self.stopped then
+    -- the events raised while it was stopped did not get here: the next run
+    -- of the reconcile timer compares the copy with shm
+    self.stopped = nil
+    resync_pending[self] = true
+  end
 
   self:log(DEBUG, "active check flagged as active")
   return true
@@ -1641,7 +2656,7 @@ function _M.new(opts)
   check_valid_type("checks.active.type", self.checks.active.type)
   check_valid_type("checks.passive.type", self.checks.passive.type)
 
-  self.shm = ngx.shared[tostring(opts.shm_name)]
+  self.shm = watched_shm(tostring(opts.shm_name))
   assert(self.shm, ("no shm found by name '%s'"):format(opts.shm_name))
 
   -- load certificate and key
@@ -1683,12 +2698,21 @@ function _M.new(opts)
   self.TARGET_LIST      = SHM_PREFIX .. self.name .. ":target_list"
   self.TARGET_LIST_LOCK = SHM_PREFIX .. self.name .. ":target_list_lock"
   self.TARGET_LOCK      = SHM_PREFIX .. self.name .. ":target_lock"
+  self.TARGET_VERSION   = SHM_PREFIX .. self.name .. ":version"
   self.PERIODIC_LOCK    = SHM_PREFIX .. ":period_lock:"
   -- prepare constants
   self.EVENT_SOURCE     = EVENT_SOURCE_PREFIX .. " [" .. self.name .. "]"
   self.LOG_PREFIX       = LOG_PREFIX .. "(" .. self.name .. ") "
 
-  -- register for events, and directly after load initial target list
+  -- The versions are read before the targets are loaded: every change up to
+  -- them is in what is loaded, and the events of later changes are applied on
+  -- top of it.
+  track_shm_version(self)
+  self.shm:add(self.TARGET_VERSION, version_init())
+  local loaded_version = self.shm:get(self.TARGET_VERSION)
+  self.version_applied = loaded_version
+
+  -- load the initial target list, and register for events directly after:
   -- order is important!
   do
     -- Lock the list, in case it is being cleared by another worker
@@ -1703,6 +2727,14 @@ function _M.new(opts)
         target.internal_health = INTERNAL_STATES[self.shm:get(state_key)]
         self:log(DEBUG, "Got initial status ", target.internal_health, " ",
                         target.hostname, " ", target.ip, ":", target.port)
+        if target.internal_health then
+          target.version = loaded_version
+        else
+          -- its state key was evicted from a full shm: the event of its last
+          -- change can still tell when it is late, so no event is taken for
+          -- covered by this load
+          self.version_applied = nil
+        end
         -- fill-in the hash part for easy lookup
         self.targets[target.ip] = self.targets[target.ip] or {}
         self.targets[target.ip][target.port] = self.targets[target.ip][target.port] or {}
@@ -1719,11 +2751,31 @@ function _M.new(opts)
 
     self.ev_callback = function(data, event)
       -- just a wrapper to be able to access `self` as a closure
-      return self:event_handler(event, data.ip, data.port, data.hostname)
+      return on_event(self, event, data)
+    end
+
+    -- Subscribe before polling. The events dispatched by that poll (with
+    -- lua-resty-events, the ones delivered while it sleeps) include changes
+    -- made after the targets were loaded above; if the checker subscribes
+    -- only in start(), they are dropped for it and its copy stays wrong until
+    -- the same target changes again. Events about earlier changes can be
+    -- dispatched as well: they are applied in order, on top of a state that
+    -- already includes them. start() unsubscribes and subscribes again, so
+    -- the checker stays subscribed once.
+    -- Not when the load was deferred to a timer (the lock was busy in a phase
+    -- that cannot yield): `targets` is still nil and the handler cannot run.
+    if self.targets then
+      worker_events.register_weak(self.ev_callback, self.EVENT_SOURCE)
     end
 
     -- handle events to sync up in case there was a change by another worker
-    worker_events:poll()
+    local pok, perr = pcall(worker_events.poll, worker_events)
+    if not pok then
+      -- e.g. lua-resty-events' poll() sleeps, which some phases do not allow:
+      -- leave no subscription behind for a checker that is never returned
+      worker_events.unregister(self.ev_callback, self.EVENT_SOURCE)
+      error(perr, 0)
+    end
   end
 
   -- turn on active health check
@@ -1786,7 +2838,9 @@ function _M.new(opts)
               if #removed_targets > 0 then
                 target_list = serialize(target_list)
 
-                local ok, err = shm:set(checker_obj.TARGET_LIST, target_list)
+                -- each checker has its own shm: `shm` above is the one of the
+                -- checker that started this timer
+                local ok, err = checker_obj.shm:set(checker_obj.TARGET_LIST, target_list)
                 if not ok then
                   return nil, "failed to store target_list in shm: " .. err
                 end
@@ -1861,6 +2915,29 @@ function _M.new(opts)
 
   table.insert(hcs, self)
 
+  -- Every worker compares its copy of the targets with shm
+  -- (apache/apisix#13888), in a timer of its own: the probes of the active
+  -- check timer can take long, and only one worker runs them.
+  if not reconcile_timer then
+    local timer_ok, timer_err = ngx_timer_every(RECONCILE_INTERVAL, reconcile)
+    if timer_ok then
+      reconcile_timer = true
+    else
+      -- tried again by the next checker created in this worker
+      self:log(ERR, "could not start the reconcile timer: ", timer_err)
+    end
+  end
+
+  -- for the scans and the background comparison of the reconcile timer
+  checkers_n = checkers_n + 1
+  checkers[checkers_n] = self
+
+  -- A change made while this checker was being created can have had its
+  -- event dispatched before the checker subscribed: compare once if so.
+  if self.shm:get(self.TARGET_VERSION) ~= self.version_applied then
+    resync_pending[self] = true
+  end
+
   -- TODO: push entire config in debug level logs
   self:log(DEBUG, "Healthchecker started!")
   return self
@@ -1932,6 +3009,38 @@ if TESTING then
   -- default CLEANUP_INTERVAL (CHECK_INTERVAL * 25).
   function _M._set_cleanup_interval(interval)
     CLEANUP_INTERVAL = interval
+  end
+
+  -- test-only hooks for the reconciliation: its counters, the work done
+  -- between two yields, and one run of the timer made right now
+  function _M._reconcile_stats()
+    return reconcile_stats
+  end
+
+  function _M._set_sync_batch(units)
+    SYNC_BATCH = units
+  end
+
+  function _M._set_sweep(units, round_ticks)
+    SWEEP_UNITS, SWEEP_ROUND_TICKS = units, round_ticks
+  end
+
+  function _M._set_event_grace(seconds)
+    EVENT_GRACE = seconds
+  end
+
+  function _M._set_max_queued_events(count)
+    MAX_QUEUED_EVENTS = count
+  end
+
+  function _M._reconcile()
+    return reconcile(false)
+  end
+
+  -- test-only hook: shorten the window in which only one capacity report is
+  -- logged for a shm
+  function _M._set_shm_report_interval(interval)
+    SHM_REPORT_INTERVAL = interval
   end
 end
 
