@@ -18,8 +18,9 @@ local hc = require "resty.healthcheck"
 local we = require "resty.worker.events"
 assert(we.configure{ shm = "ev", interval = 1 })
 
-local per_checker = tonumber(os.getenv("TARGETS_PER_CHECKER")) or 10
-assert(per_checker >= 1, "TARGETS_PER_CHECKER must be 1 or more")
+local per_checker = tonumber(os.getenv("TARGETS_PER_CHECKER") or "10")
+assert(per_checker and per_checker >= 1 and per_checker % 1 == 0,
+       "TARGETS_PER_CHECKER must be a positive integer")
 local host_len = tonumber(os.getenv("HOSTNAME_LEN")) or 0
 local with_counters = os.getenv("COUNTERS") == "1"
 local shm = ngx.shared.hc
@@ -79,8 +80,9 @@ while not full do
         assert(ok, "add_target() failed: " .. tostring(err))
         if with_counters then
             -- one failed request: creates the counter key (the threshold is 3)
-            checker:report_http_status(ip, 8080, host, 500, "passive")
+            local reported, report_err = checker:report_http_status(ip, 8080, host, 500, "passive")
             if full then break end
+            assert(reported, "report_http_status() failed: " .. tostring(report_err))
         end
         targets = i
         if targets == next_sample then
