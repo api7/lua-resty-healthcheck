@@ -515,7 +515,7 @@ compared=0
     location = /locked {
         content_by_lua_block {
             -- the target list is locked until the test unlocks it
-            local lock = assert(require("resty.lock"):new("test_shm", { exptime = 5, timeout = 0 }))
+            local lock = assert(require("resty.lock"):new("test_shm", { exptime = 0, timeout = 0 }))
             assert(lock:lock(package.loaded.list_lock_key))
             package.loaded.list_lock = lock
             ngx.say("locked")
@@ -528,6 +528,8 @@ compared=0
     }
     location = /t {
         content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
             local a = new_checker()
             assert(a:add_target(ip, 11111, nil, true))
             assert(wait_until(function() return status(a, 11111) == "true" end))
@@ -542,9 +544,13 @@ compared=0
             local c = package.loaded.deferred
             local loaded = c.targets ~= nil
 
-            -- an event for it, and runs of the timer, before its targets are loaded
+            -- Dispatch the event and finish a reconciliation run while the
+            -- lock still prevents the deferred load from completing.
             assert(a:set_target_status(ip, 11111, nil, false))
-            ngx.sleep(0.25)
+            flush_events()
+            local before = stats()
+            healthcheck._reconcile()
+            assert(since(before, "runs") == 1)
             local still = c.targets ~= nil
             assert(package.loaded.list_lock:unlock())
             local ok = wait_until(function()
