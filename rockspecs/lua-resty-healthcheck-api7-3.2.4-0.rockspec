@@ -11,6 +11,8 @@ description = {
       lua-resty-healthcheck is a module that can check upstream service
       availability by sending requests and validating responses at timed
       intervals.
+
+      Version 3.2.4 fixes an event-subscription race during checker initialization.
    ]],
    homepage = "https://github.com/api7/lua-resty-healthcheck",
    license = "Apache 2.0"
