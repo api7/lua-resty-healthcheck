@@ -81,6 +81,7 @@ jobs:
           chunk()
           local source = env.source or {}
           assert(source.platforms == nil, "platform-specific source refs are not supported")
+          assert(source.cvs_tag == nil, "legacy source refs are not supported")
           assert((source.tag or source.branch) == "v" .. arg[2],
                  "rockspec source ref must match the release tag")
           LUA
