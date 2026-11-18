@@ -46,7 +46,11 @@ local type = type
 local assert = assert
 
 
-local RESTY_EVENTS_VER = [[^0\.1\.\d+$]]
+-- Versions of lua-resty-events this library was tested with, as its compat
+-- layer reports them: `0.1.0` up to lua-resty-events 0.2.x, the version of the
+-- library itself from 0.3.0 on.
+local RESTY_EVENTS_VER = [[^0\.[1-3]\.\d+$]]
+local resty_events_version_warned = false
 local RESTY_WORKER_EVENTS_VER = "0.3.3"
 
 
@@ -111,8 +115,16 @@ local function load_events_module(self)
 
   elseif self.events_module == "resty.events" then
     worker_events = require("resty.events.compat")
-    local version_match = ngx.re.match(worker_events._VERSION, RESTY_EVENTS_VER, "o")
-    assert(version_match, "unsupported lua-resty-events version")
+    -- another version is used with a warning (once per worker) rather than
+    -- refused: refusing it makes new() fail, which leaves the caller without
+    -- health checks
+    local version = tostring(worker_events._VERSION)
+    if not resty_events_version_warned
+       and not ngx.re.match(version, RESTY_EVENTS_VER, "jo")
+    then
+      resty_events_version_warned = true
+      ngx_log(WARN, "[healthcheck] untested lua-resty-events version: ", version)
+    end
 
   else
     error("unknown events module")
