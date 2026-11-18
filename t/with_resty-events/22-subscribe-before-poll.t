@@ -72,6 +72,9 @@ __DATA__
 --- config
     location = /t {
         content_by_lua_block {
+            -- the reconcile timer would correct the copy of `b` as well:
+            -- without it, only the event does
+            ngx.timer.every = function() return true end
             local we = require "resty.events.compat"
             local a = new_checker()
             assert(a:add_target("127.0.0.1", 11111, nil, true))
@@ -194,8 +197,14 @@ GET /t
             -- the checker that new() never returned must not handle events
             local handled = 0
             if registered[1] then
-                local name, never_returned = debug.getupvalue(registered[1], 1)
-                assert(name == "self")
+                local never_returned
+                for i = 1, 10 do
+                    local name, value = debug.getupvalue(registered[1], i)
+                    if name == "self" then
+                        never_returned = value
+                    end
+                end
+                assert(never_returned)
                 never_returned.event_handler = function() handled = handled + 1 end
             end
             local a = new_checker()
