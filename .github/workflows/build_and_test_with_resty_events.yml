@@ -24,7 +24,7 @@ jobs:
       - name: Set environment variables
         env:
           OPENRESTY_VER: ${{ matrix.openresty-version }}
-          RESTY_EVENTS_VER: 0.3.0
+          RESTY_EVENTS_VER: 0.2.0
           LUAROCKS_VER: 3.12.0
           OPENSSL_VER: 3.4.1
           PCRE_VER: 10.45
@@ -66,7 +66,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Kong/lua-resty-events
-          ref: refs/tags/0.1.0
+          ref: refs/tags/${{ env.RESTY_EVENTS }}
           path: lua-resty-events
 
       - name: Build and install OpenResty
