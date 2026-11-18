@@ -84,6 +84,13 @@ Active checks are executed in the background based on the specified timer interv
 For passive health checks, the library receives explicit notifications via its
 programmatic API using functions such as `checker:report_http_status(host, port, status)`.
 
+Each checker has a `status_ver` field: a number that increases whenever the
+answer of `checker:get_target_status()` changes for one of its targets in the
+current worker. That is when a target moves between the healthy and the
+unhealthy side, when a target appears in or disappears from the worker's copy
+of the targets, and when that copy is cleared. A caller that caches something
+derived from the targets' statuses can use it as the version of that cache.
+
 See the [online LDoc documentation](http://kong.github.io/lua-resty-healthcheck)
 for the complete API.
 

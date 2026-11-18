@@ -645,6 +645,10 @@ function checker:clear()
       clear_target_data_from_shm(self, ip, port, hostname)
     end
 
+    -- this worker's copy is emptied here, not by the event below
+    if next(self.targets) then
+      self.status_ver = self.status_ver + 1
+    end
     self.targets = {}
 
     -- raise event for our removed target
@@ -1310,7 +1314,13 @@ local function checker_callback(self, health_mode)
   end
 end
 
--- Event handler callback
+-- Event handler callback.
+-- `status_ver` is bumped whenever the answer of `get_target_status()` changes
+-- for a target: its health moves between the healthy and the unhealthy side,
+-- or the target appears in, or disappears from, this worker's copy. Callers
+-- that cache what they derive from the targets' statuses use it as the cache
+-- version; for them an unknown target is not the same as an unhealthy one
+-- (Apache APISIX treats it as usable).
 function checker:event_handler(event_name, ip, port, hostname)
 
   local target_found = get_target(self, ip, port, hostname)
@@ -1335,6 +1345,7 @@ function checker:event_handler(event_name, ip, port, hostname)
           break
         end
       end
+      self.status_ver = self.status_ver + 1
       self:log(DEBUG, "event: target '", hostname or "", " (", ip, ":", port,
                       ")' removed")
 
@@ -1348,7 +1359,8 @@ function checker:event_handler(event_name, ip, port, hostname)
          event_name == self.events.unhealthy or
          event_name == self.events.mostly_unhealthy
          then
-    if not target_found then
+    local is_new = not target_found
+    if is_new then
       -- it is a new target, must add it first
       target_found = { ip = ip, port = port, hostname = hostname or ip }
       self.targets[target_found.ip] = self.targets[target_found.ip] or {}
@@ -1363,7 +1375,8 @@ function checker:event_handler(event_name, ip, port, hostname)
       local from = from_status == "healthy" or from_status == "mostly_healthy"
       local to = to_status == "healthy" or to_status == "mostly_healthy"
 
-      if from ~= to then
+      -- a new target was unknown until now, whatever its state
+      if from ~= to or is_new then
         self.status_ver = self.status_ver + 1
       end
 
@@ -1374,6 +1387,9 @@ function checker:event_handler(event_name, ip, port, hostname)
 
   elseif event_name == self.events.clear then
     -- clear local cache
+    if next(self.targets) then
+      self.status_ver = self.status_ver + 1
+    end
     self.targets = {}
     self:log(DEBUG, "event: local cache cleared")
 
