@@ -282,3 +282,49 @@ true
 qr/not changing the state of a target that was removed: \S+ [\d.]+:\d+/
 --- grep_error_log_out
 not changing the state of a target that was removed: 127.0.0.1 127.0.0.1:11111
+
+
+
+=== TEST 6: successful state replacement does not read the target list
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local a = new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(wait_until(function() return status(a, 11111) == "true" end))
+            local reads, real = 0, a.shm
+            -- Count reads without changing any shared dictionary operation.
+            local counted = setmetatable({}, {
+                __index = function(_, name)
+                    return function(_, key, ...)
+                        if name == "get" and key == a.TARGET_LIST then
+                            reads = reads + 1
+                        end
+                        return real[name](real, key, ...)
+                    end
+                end,
+            })
+            a.shm = counted
+            assert(a:set_target_status(ip, 11111, nil, false))
+            a.shm = real
+            assert(wait_until(function() return status(a, 11111) == "false" end))
+            ngx.say("forced target_list reads=", reads)
+
+            assert(a:set_target_status(ip, 11111, nil, true))
+            assert(wait_until(function() return status(a, 11111) == "true" end))
+            reads = 0
+            a.shm = counted
+            assert(a:report_http_status(ip, 11111, nil, 500, "passive"))
+            a.shm = real
+            assert(wait_until(function() return status(a, 11111) == "false" end))
+            ngx.say("report target_list reads=", reads)
+        }
+    }
+--- request
+GET /t
+--- response_body
+forced target_list reads=0
+report target_list reads=0
+--- no_error_log
+[error]
