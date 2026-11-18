@@ -343,5 +343,5 @@ GET /t
 --- response_body
 forced target_list reads=0
 report target_list reads=0
---- no_error_log eval
-qr/\[error\](?!.*lua tcp socket read timed out)/
+--- no_error_log
+[error]
