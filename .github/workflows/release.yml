@@ -1,6 +1,12 @@
 name: Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish, for example 3.2.4'
+        required: true
+        type: string
   push:
     branches:
       - "master"
@@ -14,6 +20,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
 
       - name: Install Lua
         uses: leafo/gh-actions-lua@v8
@@ -24,17 +32,61 @@ jobs:
       - name: Extract release name
         id: release_env
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          PREVIOUS_COMMIT: ${{ github.event.before }}
         run: |
-          title="${{ github.event.head_commit.message }}"
-          re="^feat: release v*(\S+)"
-          if [[ $title =~ $re ]]; then
-              v=v${BASH_REMATCH[1]}
-              echo "##[set-output name=version;]${v}"
-              echo "##[set-output name=version_withou_v;]${BASH_REMATCH[1]}"
-          else
-              echo "commit format is not correct"
+          if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+              echo "Releases must use master"
               exit 1
           fi
+
+          case "$GITHUB_EVENT_NAME" in
+              workflow_dispatch)
+                  version="$RELEASE_VERSION"
+                  ;;
+              push)
+                  git cat-file -e "$PREVIOUS_COMMIT^{commit}"
+                  mapfile -d '' -t rockspecs < <(git diff --name-only -z \
+                      "$PREVIOUS_COMMIT" "$GITHUB_SHA" -- 'rockspecs/*.rockspec')
+                  if [[ "${#rockspecs[@]}" -ne 1 ]]; then
+                      echo "Expected exactly one changed rockspec"
+                      exit 1
+                  fi
+                  pattern='^rockspecs/lua-resty-healthcheck-api7-([0-9]+\.[0-9]+\.[0-9]+)-0\.rockspec$'
+                  if [[ "${rockspecs[0]}" =~ $pattern ]]; then
+                      version="${BASH_REMATCH[1]}"
+                  else
+                      echo "Unexpected rockspec filename"
+                      exit 1
+                  fi
+                  ;;
+              *)
+                  echo "Unsupported release event"
+                  exit 1
+                  ;;
+          esac
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Expected a version such as 3.2.4"
+              exit 1
+          fi
+          rockspec="rockspecs/lua-resty-healthcheck-api7-$version-0.rockspec"
+          test -f "$rockspec"
+          luarocks lint "$rockspec"
+          "$(luarocks config variables.LUA)" - "$rockspec" "$version" <<'LUA'
+          local env = {}
+          local chunk = assert(loadfile(arg[1], "t", env))
+          if setfenv then setfenv(chunk, env) end
+          chunk()
+          local source = env.source or {}
+          assert(source.platforms == nil, "platform-specific source refs are not supported")
+          assert(source.cvs_tag == nil, "legacy source refs are not supported")
+          assert((source.tag or source.branch) == "v" .. arg[2],
+                 "rockspec source ref must match the release tag")
+          LUA
+          echo "version=v$version" >> "$GITHUB_OUTPUT"
+          echo "version_withou_v=$version" >> "$GITHUB_OUTPUT"
 
       - name: Create Release
         uses: actions/create-release@v1
