@@ -755,3 +755,34 @@ GET /t
 same list=true removed=nil/target not found members compared=2 after a run: b=true a=true
 --- no_error_log
 [error]
+
+
+
+=== TEST 14: a late clear does not erase a newer target
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local a, b = new_checker(), new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            flush_events()
+            local _, held = hold_events(function()
+                assert(a:clear())
+                assert(a:add_target(ip, 11111, nil, false))
+            end)
+            -- the unhealthy re-add arrives before the older clear
+            for _, i in ipairs({ 2, 1 }) do
+                local e = held[i]
+                events().post(e[1], e[2], e[3])
+            end
+            flush_events()
+            ngx.say("a=", status(a, 11111), " b=", status(b, 11111))
+        }
+    }
+--- request
+GET /t
+--- response_body
+a=false b=false
+--- no_error_log
+[error]

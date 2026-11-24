@@ -1726,6 +1726,7 @@ local SWEEP_ROUND_TICKS = 100
 local SYNC_COST_LISTED = 3     -- a listed target, in a comparison of the members
 local SYNC_COST_CHECKER = 2    -- a checker: its version and its list are read
 local MAX_QUEUED_EVENTS = 1000
+local MAX_REMOVED_VERSIONS = 1000
 local MAX_AHEAD = 128
 -- an event this far behind the version of the copy is not a late one
 local STALE_VERSION_GAP = 1000
@@ -1880,28 +1881,46 @@ local function track_shm_version(self)
 end
 
 
--- Handles an event of a checker.
-local function on_event(self, event, data)
+local function remember_removed(self, key, version)
+  local removed = self.removed_versions
+  if not removed then
+    removed = {}
+    self.removed_versions = removed
+    self.removed_versions_n = 0
+  end
+  if removed[key] then
+    removed[key] = version
+    return
+  end
+  if self.removed_versions_n >= MAX_REMOVED_VERSIONS then
+    -- history beyond this bound needs another comparison, not more memory
+    resync_pending[self] = true
+    return
+  end
+  removed[key] = version
+  self.removed_versions_n = self.removed_versions_n + 1
+end
+
+
+local function forget_removed(self, key)
+  local removed = self.removed_versions
+  if not removed or not removed[key] then
+    return
+  end
+  removed[key] = nil
+  self.removed_versions_n = self.removed_versions_n - 1
+  if self.removed_versions_n == 0 then
+    self.removed_versions = nil
+  end
+end
+
+
+-- Applies an event of a checker. The wrapper queues it while a comparison or
+-- its queued events are being drained.
+local function apply_event(self, event, data)
   if data.shm and data.shm ~= self.shm_name then
     -- from the checker that has this name in another shm: the source of an
     -- event only has the name
-    return
-  end
-
-  if self.syncing then
-    -- applied when the comparison with shm is done
-    local queue = self.event_queue
-    if not queue then
-      queue = {}
-      self.event_queue = queue
-    end
-    local n = #queue
-    if n >= MAX_QUEUED_EVENTS * 2 then
-      self.event_queue_overflow = true
-    else
-      queue[n + 1], queue[n + 2] = event, data
-      reconcile_stats.queued = reconcile_stats.queued + 1
-    end
     return
   end
 
@@ -1938,6 +1957,39 @@ local function on_event(self, event, data)
       resync_pending[self] = true
     end
 
+    if event == self.events.clear then
+      -- an older clear does not erase targets added or changed after it
+      local count, kept = #self.targets, 0
+      for i = 1, count do
+        local target = self.targets[i]
+        if target.version and target.version > version then
+          kept = kept + 1
+          self.targets[kept] = target
+        else
+          local by_port = self.targets[target.ip]
+          local by_hostname = by_port[target.port]
+          by_hostname[target.hostname or target.ip] = nil
+          if not next(by_hostname) then
+            by_port[target.port] = nil
+          end
+          if not next(by_port) then
+            self.targets[target.ip] = nil
+          end
+          remember_removed(self, key_for(self.TARGET_STATE, target.ip,
+                                         target.port, target.hostname), version)
+        end
+      end
+      for i = kept + 1, count do
+        self.targets[i] = nil
+      end
+      if kept < count then
+        -- a clear is one routing-view change, however many targets it removes
+        self.status_ver = self.status_ver + 1
+        self.membership_changed = true
+      end
+      return
+    end
+
     local ip = data.ip
     if ip then
       -- The changes of one target are applied in their order: an event that
@@ -1950,11 +2002,21 @@ local function on_event(self, event, data)
         return
       end
 
+      local target_key = key_for(self.TARGET_STATE, ip, port, hostname)
+      local removed = self.removed_versions
+      local removed_version = removed and removed[target_key]
+      if not target and removed_version and version <= removed_version then
+        return
+      end
+
       self:event_handler(event, ip, port, hostname)
 
-      target = target or get_target(self, ip, port, hostname)
+      target = get_target(self, ip, port, hostname)
       if target then
+        forget_removed(self, target_key)
         target.version = version
+      elseif event == self.events.remove then
+        remember_removed(self, target_key, version)
       end
       return
     end
@@ -1963,6 +2025,31 @@ local function on_event(self, event, data)
   -- of this module, during a reload: it is applied as it always was
 
   return self:event_handler(event, data.ip, data.port, data.hostname)
+end
+
+
+local function on_event(self, event, data)
+  if self.syncing or self.event_draining then
+    if data.shm and data.shm ~= self.shm_name then
+      return
+    end
+    -- applied when the comparison and the current drain are done
+    local queue = self.event_queue
+    if not queue then
+      queue = {}
+      self.event_queue = queue
+    end
+    local n = #queue
+    if n >= MAX_QUEUED_EVENTS * 2 then
+      self.event_queue_overflow = true
+    else
+      queue[n + 1], queue[n + 2] = event, data
+      reconcile_stats.queued = reconcile_stats.queued + 1
+    end
+    return
+  end
+
+  apply_event(self, event, data)
 end
 
 
@@ -2054,7 +2141,9 @@ local function sync_targets(self, budget, raw, members, version)
   for i = 1, listed do
     local entry = list[i]
     local ip, port, hostname = entry.ip, entry.port, entry.hostname or entry.ip
-    local state = INTERNAL_STATES[shm:get(key_for(state_prefix, ip, port, hostname))]
+    local target_key = key_for(state_prefix, ip, port, hostname)
+    forget_removed(self, target_key)
+    local state = INTERNAL_STATES[shm:get(target_key)]
     local target = get_target(self, ip, port, hostname)
     if state then
       if not target or target.internal_health ~= state then
@@ -2100,6 +2189,11 @@ local function sync_targets(self, budget, raw, members, version)
       if not next(by_port) then
         targets[target.ip] = nil
       end
+      remember_removed(self, key_for(state_prefix, target.ip,
+                                     target.port, target.hostname), version)
+    end
+    if sync_spend(budget, 1 / 8) and (self.targets ~= targets or self.stopped) then
+      return false
     end
   end
   for i = kept + 1, count do
@@ -2116,7 +2210,17 @@ local function sync_targets(self, budget, raw, members, version)
   -- the members of the copy change
   self.membership_changed = nil
   self.synced_list = complete and raw or nil
-  sync_spend(budget, count / 8)
+
+  if not covered then
+    local removed = self.removed_versions
+    if removed then
+      for key, seen in pairs(removed) do
+        if seen and (not version or seen > version) then
+          removed[key] = version
+        end
+      end
+    end
+  end
 
   return corrected, covered
 end
@@ -2163,6 +2267,10 @@ local function sync_from_shm(self, budget)
     -- version. After any other, every event is applied and followed by a
     -- comparison (see `on_event`).
     self.version_applied = covered and version or nil
+    if covered then
+      self.removed_versions = nil
+      self.removed_versions_n = nil
+    end
     -- The version this copy was last compared at, also when shm could not
     -- tell everything: the scan of the timer goes by it then, so that a
     -- change of another checker does not have this one compared again.
@@ -2173,8 +2281,28 @@ local function sync_from_shm(self, budget)
   local queue = self.event_queue
   if queue then
     self.event_queue = nil
-    for i = 1, #queue, 2 do
-      on_event(self, queue[i], queue[i + 1])
+    self.event_draining = true
+    local drain_ok, drain_err = pcall(function()
+      for i = 1, #queue, 2 do
+        apply_event(self, queue[i], queue[i + 1])
+        sync_spend(budget, 1)
+        if self.stopped then
+          local remaining = {}
+          for j = i + 1, #queue, 2 do
+            remaining[#remaining + 1], remaining[#remaining + 2] = queue[j], queue[j + 1]
+          end
+          self.event_queue = remaining
+          break
+        end
+      end
+    end)
+    self.event_draining = nil
+    if not drain_ok then
+      error(drain_err)
+    end
+    if self.event_queue and not self.stopped then
+      -- events that arrived during the drain get their own run
+      resync_pending[self] = true
     end
   end
   if self.event_queue_overflow then

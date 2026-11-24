@@ -126,10 +126,12 @@ copies with the shm:
   targets a round takes longer: (targets + 2 x checkers) / 200 seconds.
 
 So a copy is put right about 0.1 s after an event was lost. A comparison
-yields every 1,000 targets or so, only one runs at a time in a worker, and
-the events that arrive for a checker while it is being compared are kept and
-applied afterwards. A comparison only reads the shm: it writes nothing and
-raises no event. It logs `reconciled <n> target(s) with shm` at info level
+yields every 1,000 accounted units during target scans, removal, and
+queued-event draining. Decoding a changed target list is an atomic step that
+can exceed this batch. Only one comparison runs at a time in a worker, and the
+events that arrive for a checker while it is being compared or drained are
+kept and applied afterwards. A comparison only reads the shm: it writes nothing
+and raises no event. It logs `reconciled <n> target(s) with shm` at info level
 when it had something to correct, and increments `status_ver` as an event
 would.
 
@@ -141,6 +143,12 @@ newer state for their target, and compares the checker again after each. For a
 missing state key that lasts until the target changes state again, which
 writes the key. The events of one target are applied in the order of its
 changes, so one that arrives after a later one changes nothing.
+
+Targets removed by a comparison or by a clear keep a bounded version marker,
+so an older event cannot add them back. A late clear removes only targets
+whose versions it covers and preserves newer targets. At most 1,000 such
+markers are kept per checker; beyond that, another comparison is scheduled and
+older history follows the limits below.
 
 The data of an event has three more fields for this: `version`,
 `shm_version` and `shm`. Events without them, from workers that still run an

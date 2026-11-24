@@ -401,3 +401,39 @@ GET /t
 after the comparison=false after the late removal=false after a run=false
 --- no_error_log eval
 qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 7: an incomplete comparison does not let an older status resurrect a removed target
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local shm = ngx.shared.test_shm
+            local a, b = new_checker(), new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(a:add_target(ip, 22222, nil, true))
+            flush_events()
+            local _, held = hold_events(function()
+                assert(a:set_target_status(ip, 11111, nil, false))
+                assert(a:remove_target(ip, 11111, ip))
+            end)
+            -- the other missing state makes this comparison incomplete
+            shm:delete(key_of(a.TARGET_STATE, 22222))
+            healthcheck._reconcile()
+            assert(status(b, 11111) == "nil/target not found")
+            assert(b.version_applied == nil)
+            -- this status predates the removal already read from the list
+            events().post(held[1][1], held[1][2], held[1][3])
+            flush_events()
+            ngx.say("a=", status(a, 11111), " b=", status(b, 11111))
+        }
+    }
+--- request
+GET /t
+--- response_body
+a=nil/target not found b=nil/target not found
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/

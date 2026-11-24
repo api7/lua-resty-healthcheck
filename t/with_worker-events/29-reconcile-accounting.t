@@ -777,3 +777,87 @@ GET /t
 false b=nil/target not found a=nil/target not found targets=3 status_ver+1
 --- no_error_log
 [error]
+
+
+
+=== TEST 17: removal yields during the compaction loop
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local a = new_checker()
+            for port = 20001, 20020 do
+                assert(a:add_target(ip, port, nil, true))
+            end
+            flush_events()
+            lose_events(function()
+                for port = 20002, 20020 do
+                    assert(a:remove_target(ip, port, ip))
+                end
+            end)
+            healthcheck._set_sync_batch(1)
+            local removal_yield = false
+            yield_hook = {
+                cond = function()
+                    local by_port = a.targets[ip]
+                    if not by_port then
+                        return false
+                    end
+                    local remaining = 0
+                    for _ in pairs(by_port) do
+                        remaining = remaining + 1
+                    end
+                    return remaining > 0 and remaining < 20
+                end,
+                fn = function() removal_yield = true end,
+            }
+            healthcheck._reconcile()
+            ngx.say("yield inside removal=", tostring(removal_yield), " ", status(a, 20002))
+        }
+    }
+--- request
+GET /t
+--- response_body
+yield inside removal=true nil/target not found
+--- no_error_log
+[error]
+
+
+
+=== TEST 18: draining queued events yields after the batch
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local b = new_checker()
+            assert(b:add_target(ip, 11111, nil, true))
+            flush_events()
+            healthcheck._set_max_queued_events(2000)
+            healthcheck._set_sync_batch(1000)
+            b.syncing = true
+            for i = 1, 1001 do
+                b.ev_callback({ ip = ip, port = 11111, hostname = ip, version = i }, "unhealthy")
+            end
+            b.syncing = nil
+            lose_events(function()
+                assert(b:set_target_status(ip, 11111, nil, false))
+            end)
+            local drain_yield = false
+            yield_hook = {
+                cond = function() return b.event_draining end,
+                fn = function() drain_yield = true end,
+            }
+            healthcheck._reconcile()
+            ngx.say("yield while draining=", tostring(drain_yield))
+        }
+    }
+--- request
+GET /t
+--- response_body
+yield while draining=true
+--- no_error_log
+[error]
