@@ -24,6 +24,9 @@ __DATA__
         content_by_lua_block {
             local we = require "resty.worker.events"
             assert(we.configure{ shm = "my_worker_events", interval = 0.1 })
+            -- the reconcile timer would correct the copy of `b` as well:
+            -- without it, only the event does
+            ngx.timer.every = function() return true end
             local healthcheck = require("resty.healthcheck")
             local opts = {
                 name = "testing",
@@ -159,7 +162,12 @@ qq{
 --- config
     location = /t {
         content_by_lua_block {
-            ngx.sleep(0.5)
+            -- the timer that loads the targets runs once the lock is free
+            local deadline = ngx.now() + 3
+            while not b.targets and ngx.now() < deadline do
+                ngx.sleep(0.01)
+                ngx.update_time()
+            end
             ngx.say("targets right after new(): ", targets_after_new)
             ngx.say("loaded later: ", type(b.targets), " ",
                     tostring(b:get_target_status("127.0.0.1", 11111)))
@@ -207,8 +215,14 @@ loaded later: table false
             -- the checker that new() never returned must not handle events
             local handled = 0
             if registered[1] then
-                local name, never_returned = debug.getupvalue(registered[1], 1)
-                assert(name == "self")
+                local never_returned
+                for i = 1, 10 do
+                    local name, value = debug.getupvalue(registered[1], i)
+                    if name == "self" then
+                        never_returned = value
+                    end
+                end
+                assert(never_returned)
                 never_returned.event_handler = function() handled = handled + 1 end
             end
             local a = healthcheck.new(opts)

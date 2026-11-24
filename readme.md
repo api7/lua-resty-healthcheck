@@ -94,6 +94,66 @@ derived from the targets' statuses can use it as the version of that cache.
 See the [online LDoc documentation](http://kong.github.io/lua-resty-healthcheck)
 for the complete API.
 
+## Keeping the workers in step
+
+Each worker has its own copy of the targets of a checker and of their status,
+which is what `checker:get_target_status()` reads. The copy is kept up to date
+by the events this library raises for every change. An event that does not
+reach a worker, because it was lost on the way or dispatched just before the
+checker subscribed, leaves that copy wrong, so every worker also compares its
+copies with the shm:
+
+- Every change increments a version of its checker and a version of the shm,
+  both kept in the shm, and its event carries the two numbers. A worker that
+  got every event knows which versions the shm must have.
+- A timer in each worker reads the version of each shm every 0.1 s. When it
+  is the expected one there is nothing else to do, however many checkers and
+  changes there are.
+- When the shm is ahead, and still is 5 ms later (the events may be on their
+  way), the worker reads the version of each of its checkers and compares the
+  ones that are behind with the shm, target by target: statuses are taken
+  from the shm, targets are added and removed to match the target list. An
+  event that is later than that is handled like a lost one, and ignored when
+  it comes. lua-resty-events pauses 50 ms after every 100 events a worker
+  sends, so this happens regularly when changes are frequent: such a run of
+  the timer costs one read per checker of the worker, and one comparison per
+  checker that changed.
+- In the background, every checker is also compared in turn whatever the
+  versions say, which covers what versions cannot tell (a version key evicted
+  from a full shm, a worker that still runs an older version of this library
+  during a reload). A checker is compared at most once every 10 s, and each
+  run of the timer spends a fixed amount of work on this, so with many
+  targets a round takes longer: (targets + 2 x checkers) / 200 seconds.
+
+So a copy is put right about 0.1 s after an event was lost. A comparison
+yields every 1,000 accounted units during target scans, removal, and
+queued-event draining. Decoding a changed target list is an atomic step that
+can exceed this batch. Only one comparison runs at a time in a worker, and the
+events that arrive for a checker while it is being compared or drained are
+kept and applied afterwards. A comparison only reads the shm: it writes nothing
+and raises no event. It logs `reconciled <n> target(s) with shm` at info level
+when it had something to correct, and increments `status_ver` as an event
+would.
+
+A comparison can only take from the shm what is there. When the state of a
+listed target, or the target list, was evicted from a shm that is full, the
+worker keeps what it has for it. Until a comparison can read everything again,
+it also applies the events of that checker that come late, unless it read a
+newer state for their target, and compares the checker again after each. For a
+missing state key that lasts until the target changes state again, which
+writes the key. The events of one target are applied in the order of its
+changes, so one that arrives after a later one changes nothing.
+
+Targets removed by a comparison or by a clear keep a bounded version marker,
+so an older event cannot add them back. A late clear removes only targets
+whose versions it covers and preserves newer targets. At most 1,000 such
+markers are kept per checker; beyond that, another comparison is scheduled and
+older history follows the limits below.
+
+The data of an event has three more fields for this: `version`,
+`shm_version` and `shm`. Events without them, from workers that still run an
+older version of this library during a reload, are applied as before.
+
 ## Sizing the shm
 
 All checkers that use the same `shm_name` keep their data in that
@@ -111,6 +171,8 @@ What is stored:
 | state of a target | one per target | 256 bytes (*) |
 | counters of a target | one per target, created by the first report or probe result that is counted for it | 256 bytes (*) |
 | target list of a checker | one per checker, a single value | about 50 bytes per target, more with long hostnames or metadata; 256 bytes for one target, 1 KB for 10, whole 4 KB pages above 2 KB |
+| version of a checker | one per checker | 256 bytes (*) |
+| version of the shm | one | 128 bytes |
 
 (*) An entry takes a slot of 128, 256, 512... bytes, depending mostly on the
 length of its key, which contains the name of the checker and the ip, port and
@@ -134,23 +196,23 @@ because the target list of a checker is one value: it needs a run of
 contiguous free pages, and it is written again, one entry longer, every time
 a target is added. Measured in a 10m dictionary, with checkers named as APISIX
 names them and targets added until the first write that evicted entries or
-failed (in all rows but the first and the fifth it was a write of a target
-list that failed):
+failed (which of the two comes first depends on the layout; in the fourth and
+the fifth row it was a write of a target list that failed):
 
 | Targets per checker | Counters | Bytes per target | Targets when the shm was full | Free pages left then |
 |---|---|---|---|---|
-| 1 | no | 512 | 20,300 | 0% |
-| 10 | no | 359 | 29,000 | 0% |
-| 100 | no | 338 | 28,000 | 9% |
-| 1,000 | no | 305 | 19,000 | 45% |
-| 10 | yes | 615 | 16,900 | 0% |
-| 100, with 40-character hostnames | yes | 594 | 16,800 | 5% |
+| 1 | no | 768 | 13,600 | 0% |
+| 10 | no | 384 | 27,100 | 0% |
+| 100 | no | 341 | 27,600 | 10% |
+| 1,000 | no | 306 | 19,000 | 45% |
+| 10 | yes | 640 | 16,300 | 0% |
+| 100, with 40-character hostnames | yes | 597 | 16,500 | 6% |
 
 So, to size the dictionary:
 
-- count 512 bytes per target for its state and its counters, plus 50 to 250
-  bytes per target for the target lists (the fewer targets per checker, the
-  more);
+- count 512 bytes per target for its state and its counters, 256 bytes per
+  checker for its version, plus 50 to 250 bytes per target for the target
+  lists (the fewer targets per checker, the more);
 - then leave room for the target lists to be rewritten: with 100 targets per
   checker the shm was full with a tenth of its pages still free, with 1,000
   targets per checker with almost half of them free. The free space of the
@@ -158,7 +220,7 @@ So, to size the dictionary:
   `apisix_shared_dict_free_space_bytes`) therefore does not tell how many more
   targets fit when checkers are large;
 - a single number of targets that fits a given size does not exist: 10m held
-  between 16,800 and 29,000 targets in the cases above.
+  between 13,600 and 27,600 targets in the cases above.
 
 The numbers were measured with OpenResty 1.29.2.4 on a 64-bit Linux with 4 KB
 pages; `t/shm-sizing/measure_shm.lua` reproduces them.
