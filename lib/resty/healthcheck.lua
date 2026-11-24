@@ -679,8 +679,9 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
     local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
     local ok, err
     local state_filled = false
+    local state_added = false
+    local known = get_target(self, ip, port, hostname)
     if found then
-      local known = get_target(self, ip, port, hostname)
       if known and known.internal_health then
         internal_health = known.internal_health
       end
@@ -690,11 +691,27 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
       elseif err == "exists" then
         ok, err = true, nil
       end
+    elseif known then
+      -- The list can be lost while this worker still knows the target. If the
+      -- shared state remains, use it and keep its counter: it may be newer
+      -- than this worker's copy. If it is gone, this is an ordinary re-add
+      -- after removal, so retain the usual fresh-target behavior.
+      ok, err = self.shm:add(state_key, INTERNAL_STATES[internal_health])
+      if ok then
+        self.shm:delete(key_for(self.TARGET_COUNTER, ip, port, hostname))
+        state_added = true
+      elseif err == "exists" then
+        internal_health = INTERNAL_STATES[self.shm:get(state_key)] or internal_health
+        ok, err = true, nil
+      end
     else
       -- a new target counts from zero: a report made for it after an earlier
       -- removal, by a worker whose copy still had it, can have left a counter
       self.shm:delete(key_for(self.TARGET_COUNTER, ip, port, hostname))
       ok, err = self.shm:set(state_key, INTERNAL_STATES[internal_health])
+      if ok then
+        state_added = true
+      end
     end
     if not ok then
       -- a checker created later would load a listed target without a state
@@ -716,7 +733,7 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
 
     ok, err = self.shm:set(self.TARGET_LIST, target_list)
     if not ok then
-      if not found then
+      if state_added then
         -- leave no state behind for a target that is not listed
         self.shm:delete(state_key)
       end
@@ -781,6 +798,13 @@ function checker:remove_target(ip, port, hostname)
     end
 
     if not target_found then
+      local known = get_target(self, ip, port, hostname)
+      if known then
+        -- A failed list replacement may have removed the list without sending
+        -- the removal event. Reconcile this worker's copy and orphaned state.
+        clear_target_data_from_shm(self, known.ip, known.port, known.hostname)
+        self:raise_event(self.events.remove, known.ip, known.port, known.hostname)
+      end
       return true
     end
 

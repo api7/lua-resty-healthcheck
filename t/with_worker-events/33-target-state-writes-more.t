@@ -88,7 +88,7 @@ our $HttpConfig = qq{
 
         -- a shm whose `methods` (set() if not given) fail for one key, as
         -- when the shm is full
-        function failing_shm(real, failing_key, methods)
+        function failing_shm(real, failing_key, methods, delete_on_failure)
             local failing = {}
             for _, name in ipairs(methods or { "set" }) do
                 failing[name] = true
@@ -98,6 +98,9 @@ our $HttpConfig = qq{
                     local method = real[name]
                     return function(_, key, ...)
                         if failing[name] and key == failing_key then
+                            if delete_on_failure then
+                                method(real, key, nil)
+                            end
                             return nil, "no memory"
                         end
                         return method(real, key, ...)
@@ -332,3 +335,122 @@ forced target_list reads=0
 report target_list reads=0
 --- no_error_log
 [error]
+
+
+
+
+=== TEST 7: reconstructing a lost list keeps the newer shared state and the transition counter
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local we = require "resty.worker.events"
+            local shm = ngx.shared.test_shm
+            local a, b = new_checker(3), new_checker(3)
+            local state_key = key_of(a.TARGET_STATE, 11111)
+            local counter_key = key_of(a.TARGET_COUNTER, 11111)
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(wait_until(function()
+                return status(a, 11111) == "true" and status(b, 11111) == "true"
+            end))
+
+            we.unregister(b.ev_callback, b.EVENT_SOURCE)
+            assert(a:report_http_status(ip, 11111, nil, 500, "passive"))
+            assert(wait_until(function()
+                return a.targets[1].internal_health == "mostly_healthy"
+            end))
+            assert(b.targets[1].internal_health == "healthy")
+            shm:delete(a.TARGET_LIST)
+
+            we.register(b.ev_callback, b.EVENT_SOURCE)
+            assert(b:add_target(ip, 11111, nil, true))
+            flush_events()
+            ngx.say("state=", shm:get(state_key), " counter=", shm:get(counter_key),
+                    " a=", a.targets[1].internal_health,
+                    " b=", b.targets[1].internal_health)
+        }
+    }
+--- request
+GET /t
+--- response_body
+state=3 counter=256 a=mostly_healthy b=mostly_healthy
+--- no_error_log
+lua entry thread aborted
+
+
+
+=== TEST 8: removing a local ghost lets a later addition start with the caller's default
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local shm = ngx.shared.test_shm
+            local a = new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(a:add_target(ip, 22222, nil, true))
+            assert(wait_until(function()
+                return status(a, 11111) == "true" and status(a, 22222) == "true"
+            end))
+            assert(a:set_target_status(ip, 11111, nil, false))
+            assert(wait_until(function() return status(a, 11111) == "false" end))
+
+            local real = a.shm
+            a.shm = failing_shm(real, a.TARGET_LIST, { "set" }, true)
+            local ok, err = a:remove_target(ip, 11111, ip)
+            a.shm = real
+            assert(ok == nil and err == "failed to store target_list in shm: no memory")
+            assert(a:add_target(ip, 22222, nil, true))
+            assert(a:remove_target(ip, 11111, ip))
+            flush_events()
+            local removed = status(a, 11111)
+
+            local initial = a:get_target_status(ip, 11111)
+            if initial == nil then
+                initial = true
+            end
+            assert(a:add_target(ip, 11111, nil, initial))
+            flush_events()
+            ngx.say("removed=", removed, " readded=", status(a, 11111),
+                    " other=", status(a, 22222))
+        }
+    }
+--- request
+GET /t
+--- response_body
+removed=nil/target not found readded=true other=true
+--- no_error_log
+lua entry thread aborted
+
+
+
+=== TEST 9: a failed list reconstruction does not delete a state that already existed
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local shm = ngx.shared.test_shm
+            local a = new_checker(3)
+            local state_key = key_of(a.TARGET_STATE, 11111)
+            local counter_key = key_of(a.TARGET_COUNTER, 11111)
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(wait_until(function() return status(a, 11111) == "true" end))
+            assert(a:report_http_status(ip, 11111, nil, 500, "passive"))
+            assert(wait_until(function()
+                return a.targets[1].internal_health == "mostly_healthy"
+            end))
+            shm:delete(a.TARGET_LIST)
+
+            local real = a.shm
+            a.shm = failing_shm(real, a.TARGET_LIST)
+            local ok, err = a:add_target(ip, 11111, nil, true)
+            a.shm = real
+            assert(ok == nil and err == "failed to store target_list in shm: no memory")
+            ngx.say("state=", shm:get(state_key), " counter=", shm:get(counter_key))
+        }
+    }
+--- request
+GET /t
+--- response_body
+state=3 counter=256
+--- no_error_log
+lua entry thread aborted
