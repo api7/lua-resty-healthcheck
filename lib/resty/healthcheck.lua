@@ -1882,6 +1882,9 @@ end
 
 
 local function remember_removed(self, key, version)
+  if not version then
+    return
+  end
   local removed = self.removed_versions
   if not removed then
     removed = {}
@@ -2029,7 +2032,7 @@ end
 
 
 local function on_event(self, event, data)
-  if self.syncing or self.event_draining then
+  if self.syncing or self.event_draining or self.event_queue then
     if data.shm and data.shm ~= self.shm_name then
       return
     end
@@ -2215,7 +2218,7 @@ local function sync_targets(self, budget, raw, members, version)
     local removed = self.removed_versions
     if removed then
       for key, seen in pairs(removed) do
-        if seen and (not version or seen > version) then
+        if seen and seen > version then
           removed[key] = version
         end
       end
@@ -2243,6 +2246,11 @@ local function sync_from_shm(self, budget)
   local shm = self.shm
   -- read first: every change up to this version is in what is read after it
   local version = shm:get(self.TARGET_VERSION)
+  if not version then
+    -- a missing version key makes all removal markers unreliable
+    self.removed_versions = nil
+    self.removed_versions_n = nil
+  end
   local raw, err = shm:get(self.TARGET_LIST)
   if err then
     return nil, "failed to fetch target_list from shm: " .. err
@@ -2282,20 +2290,32 @@ local function sync_from_shm(self, budget)
   if queue then
     self.event_queue = nil
     self.event_draining = true
+    local i = 1
     local drain_ok, drain_err = pcall(function()
-      for i = 1, #queue, 2 do
-        apply_event(self, queue[i], queue[i + 1])
-        sync_spend(budget, 1)
+      while i <= #queue do
         if self.stopped then
-          local remaining = {}
-          for j = i + 1, #queue, 2 do
-            remaining[#remaining + 1], remaining[#remaining + 2] = queue[j], queue[j + 1]
-          end
-          self.event_queue = remaining
           break
         end
+        apply_event(self, queue[i], queue[i + 1])
+        -- an error after this point cannot apply the event a second time
+        i = i + 2
+        sync_spend(budget, 1)
       end
     end)
+
+    if self.stopped or not drain_ok then
+      local remaining = {}
+      local function append(source, from)
+        for j = from, #source, 2 do
+          remaining[#remaining + 1], remaining[#remaining + 2] = source[j], source[j + 1]
+        end
+      end
+      append(queue, i)
+      if self.event_queue then
+        append(self.event_queue, 1)
+      end
+      self.event_queue = remaining
+    end
     self.event_draining = nil
     if not drain_ok then
       error(drain_err)
@@ -3159,6 +3179,10 @@ if TESTING then
 
   function _M._set_max_queued_events(count)
     MAX_QUEUED_EVENTS = count
+  end
+
+  function _M._set_max_removed_versions(count)
+    MAX_REMOVED_VERSIONS = count
   end
 
   function _M._reconcile()

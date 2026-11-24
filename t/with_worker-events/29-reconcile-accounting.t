@@ -861,3 +861,136 @@ GET /t
 yield while draining=true
 --- no_error_log
 [error]
+
+
+
+=== TEST 19: later events stay behind a pending queue
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local b = new_checker()
+            assert(b:add_target(ip, 11111, nil, true))
+            flush_events()
+            local seen = {}
+            local handler = b.event_handler
+            b.event_handler = function(self, event, ...)
+                seen[#seen + 1] = event
+                return handler(self, event, ...)
+            end
+            b.syncing = true
+            b.ev_callback({ ip = ip, port = 11111, hostname = ip }, "unhealthy")
+            b.syncing = nil
+            b.ev_callback({ ip = ip, port = 11111, hostname = ip }, "healthy")
+            local queued = #b.event_queue
+            healthcheck._set_sweep(1000, 1)
+            healthcheck._reconcile()
+            ngx.say("queued=", queued, " first=", seen[1], " second=", seen[2])
+        }
+    }
+--- request
+GET /t
+--- response_body
+queued=4 first=unhealthy second=healthy
+--- no_error_log
+[error]
+
+
+
+=== TEST 20: stopping a drain preserves old and newly arriving events
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local b = new_checker()
+            assert(b:add_target(ip, 11111, nil, true))
+            flush_events()
+            b.syncing = true
+            for _ = 1, 3 do
+                b.ev_callback({ ip = ip, port = 11111, hostname = ip }, "unhealthy")
+            end
+            b.syncing = nil
+            healthcheck._set_sync_batch(1)
+            local applied = 0
+            local handler = b.event_handler
+            b.event_handler = function(self, event, ...)
+                applied = applied + 1
+                return handler(self, event, ...)
+            end
+            yield_hook = {
+                cond = function() return b.event_draining end,
+                fn = function()
+                    b.ev_callback({ ip = ip, port = 11111, hostname = ip }, "healthy")
+                    b:stop()
+                end,
+            }
+            healthcheck._set_sweep(1000, 1)
+            healthcheck._reconcile()
+            local at_stop = applied
+            local remaining = b.event_queue and #b.event_queue / 2 or 0
+            local stopped = tostring(b.stopped)
+            b:start()
+            healthcheck._reconcile()
+            ngx.say("at_stop=", at_stop, " remaining=", remaining, " stopped=", stopped,
+                    " final=", status(b, 11111))
+        }
+    }
+--- request
+GET /t
+--- response_body
+at_stop=1 remaining=3 stopped=true final=true
+--- no_error_log
+[error]
+
+
+
+=== TEST 21: an event handler error preserves the current and remaining events
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local b = new_checker()
+            assert(b:add_target(ip, 11111, nil, true))
+            flush_events()
+            b.syncing = true
+            for _ = 1, 3 do
+                b.ev_callback({ ip = ip, port = 11111, hostname = ip }, "unhealthy")
+            end
+            b.syncing = nil
+            healthcheck._set_sync_batch(1)
+            local calls = 0
+            local handler = b.event_handler
+            b.event_handler = function(self, event, ...)
+                calls = calls + 1
+                if calls == 2 then
+                    error("boom")
+                end
+                return handler(self, event, ...)
+            end
+            yield_hook = {
+                cond = function() return b.event_draining end,
+                fn = function()
+                    b.ev_callback({ ip = ip, port = 11111, hostname = ip }, "healthy")
+                end,
+            }
+            healthcheck._set_sweep(1000, 1)
+            healthcheck._reconcile()
+            local draining = tostring(b.event_draining)
+            local remaining = b.event_queue and #b.event_queue / 2 or 0
+            b.event_handler = handler
+            healthcheck._reconcile()
+            ngx.say("draining=", draining, " remaining=", remaining, " final=", status(b, 11111))
+        }
+    }
+--- request
+GET /t
+--- response_body
+draining=nil remaining=3 final=true
+--- error_log
+boom

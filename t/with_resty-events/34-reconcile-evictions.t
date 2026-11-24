@@ -437,3 +437,73 @@ GET /t
 a=nil/target not found b=nil/target not found
 --- no_error_log eval
 qr/\[error\](?!.*lua tcp socket read timed out)/
+
+
+
+=== TEST 8: tombstone counts survive resets, the cap, and complete comparisons
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local shm = ngx.shared.test_shm
+            local a, b = new_checker(), new_checker()
+            assert(a:add_target(ip, 11111, nil, true))
+            assert(a:add_target(ip, 22222, nil, true))
+            flush_events()
+            local _, held = hold_events(function()
+                assert(a:set_target_status(ip, 11111, nil, false))
+                assert(a:remove_target(ip, 11111, ip))
+            end)
+            shm:delete(key_of(a.TARGET_STATE, 22222))
+            healthcheck._reconcile()
+            assert(b.removed_versions_n == 1)
+            healthcheck._set_sweep(1000, 1)
+            shm:delete(a.TARGET_VERSION)
+            assert(shm:get(a.TARGET_VERSION) == nil)
+            healthcheck._reconcile()
+            local reset = tostring(b.removed_versions_n)
+
+            healthcheck._set_max_removed_versions(0)
+            shm:set(a.TARGET_VERSION, 1000)
+            assert(a:add_target(ip, 11111, nil, false))
+            flush_events()
+            lose_events(function() assert(a:remove_target(ip, 11111, ip)) end)
+            healthcheck._reconcile()
+            local capped = tostring(b.removed_versions_n)
+
+            healthcheck._set_max_removed_versions(1)
+            assert(a:add_target(ip, 11111, nil, false))
+            flush_events()
+            lose_events(function() assert(a:remove_target(ip, 11111, ip)) end)
+            healthcheck._reconcile()
+            local recorded = tostring(b.removed_versions_n)
+
+            assert(a:add_target(ip, 33333, nil, false))
+            flush_events()
+            lose_events(function() assert(a:remove_target(ip, 33333, ip)) end)
+            healthcheck._reconcile()
+            local capped_again = tostring(b.removed_versions_n)
+
+            assert(shm:set(key_of(a.TARGET_STATE, 22222), 1))
+            healthcheck._reconcile()
+            local cleared = tostring(b.removed_versions_n)
+
+            assert(a:add_target(ip, 33333, nil, false))
+            flush_events()
+            lose_events(function() assert(a:remove_target(ip, 33333, ip)) end)
+            shm:delete(key_of(a.TARGET_STATE, 22222))
+            healthcheck._reconcile()
+            local rerecorded = tostring(b.removed_versions_n)
+            ngx.say("reset=", reset, " capped=", capped, " recorded=", recorded,
+                    " capped_again=", capped_again, " cleared=", cleared,
+                    " rerecorded=", rerecorded)
+        }
+    }
+--- request
+GET /t
+--- response_body
+reset=nil capped=0 recorded=1 capped_again=1 cleared=nil rerecorded=1
+--- no_error_log eval
+qr/\[error\](?!.*lua tcp socket read timed out)/
