@@ -2307,6 +2307,11 @@ local function sync_from_shm(self, budget)
       local remaining = {}
       local function append(source, from)
         for j = from, #source, 2 do
+          if #remaining >= MAX_QUEUED_EVENTS * 2 then
+            self.event_queue_overflow = true
+            resync_pending[self] = true
+            return
+          end
           remaining[#remaining + 1], remaining[#remaining + 2] = source[j], source[j + 1]
         end
       end

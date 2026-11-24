@@ -1010,3 +1010,53 @@ GET /t
 draining=nil remaining=3 final=true
 --- error_log
 boom
+
+
+
+=== TEST 22: queue preservation stays bounded after repeated errors
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            no_reconcile_timer()
+            local healthcheck = require("resty.healthcheck")
+            local b = new_checker()
+            assert(b:add_target(ip, 11111, nil, true))
+            flush_events()
+            healthcheck._set_max_queued_events(2)
+            b.syncing = true
+            for _ = 1, 4 do
+                b.ev_callback({ ip = ip, port = 11111, hostname = ip }, "unhealthy")
+            end
+            b.syncing = nil
+            healthcheck._set_sync_batch(1)
+            local calls = 0
+            local handler = b.event_handler
+            b.event_handler = function(self, event, ...)
+                calls = calls + 1
+                if calls == 2 then
+                    error("boom")
+                end
+                return handler(self, event, ...)
+            end
+            yield_hook = {
+                cond = function() return b.event_draining end,
+                fn = function()
+                    b.ev_callback({ ip = ip, port = 11111, hostname = ip }, "healthy")
+                end,
+            }
+            healthcheck._set_sweep(1000, 1)
+            healthcheck._reconcile()
+            local retained = b.event_queue and #b.event_queue / 2 or 0
+            local overflow = tostring(b.event_queue_overflow)
+            b.event_handler = handler
+            healthcheck._reconcile()
+            ngx.say("retained=", retained, " overflow=", overflow)
+        }
+    }
+--- request
+GET /t
+--- response_body
+retained=2 overflow=true
+--- error_log
+boom
