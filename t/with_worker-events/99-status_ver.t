@@ -50,6 +50,7 @@ our $HttpConfig = qq{
                 }
             })
 
+            _G.checker = checker
             local my_id = ngx.worker.id()
             local event_handler = checker.event_handler
             checker.event_handler = function(self, event, ip, port, hostname)
@@ -83,9 +84,8 @@ our $HttpConfig = qq{
             end
 
             local ok, err = checker:add_target("127.0.0.1", 11111)
-            if not ok then
-                error(err)
-            end
+            assert(ok == true, err)
+            shm:set("add_ok:" .. my_id, true)
         end)
     }
 };
@@ -101,10 +101,11 @@ __DATA__
         content_by_lua_block {
             local shm = ngx.shared.test_shm
             local deadline = ngx.now() + 10
-            while not (shm:get("unhealthy:0") and shm:get("unhealthy:1")) do
+            while not (shm:get("add_ok:0") and shm:get("add_ok:1")
+                       and shm:get("unhealthy:0") and shm:get("unhealthy:1")) do
                 ngx.update_time()
                 assert(ngx.now() < deadline,
-                       "the unhealthy event did not reach both workers")
+                       "add_target or unhealthy delivery did not complete on both workers")
                 ngx.sleep(0.01)
             end
             ngx.say(true)
