@@ -179,17 +179,33 @@ length of its key, which contains the name of the checker and the ip, port and
 hostname of the target. 256 bytes is what the names used in the measurements
 below need.
 
-A write to a shm that is full first evicts the entries that were used least
-recently, up to 30 of them, which can be the state of another target or the
-target list of another checker. If that does not free a large enough block,
-the write fails with `no memory`, after those evictions and after the value
-the key had before was removed: an `add_target()` that fails this way leaves
-its checker without a target list in the shm. This library logs it when one
-of its writes evicts entries (a warning) or fails (an error), both as `shm
-'<name>' is full: ...`, and when a checker finds that its target list is gone
-(an error, `shm '<name>' no longer has the target list of checker ...`): at
-most one warning and one error a minute for each shm in each worker, so a
-failed write and a lost target list share the error.
+An ordinary write to a full shm can evict up to 30 least recently used
+entries, including another target's state or another checker's list. A failed
+replacement can discard the old value before returning `no memory`.
+
+When changing an existing target list, the library holds the list lock and
+stages the proposed serialized list under a separate key in the same shm.
+Staging and publication use non-evicting writes. If staging fails, the
+existing primary list stays readable and the change returns an error. A
+shrink or clear needs room to stage the smaller proposed list. Successful
+updates normally write the proposed bytes twice and retire the staging key.
+
+If replacing the primary discards it after staging has succeeded, the staged
+list becomes authoritative and the change completes, including its normal
+status cleanup and events. The library tries to put those bytes back under
+the legacy primary key. If there is room only for the staged copy, upgraded
+workers can read it and retry publication under the lock on later reads.
+During a rolling upgrade, older workers can see an empty list in this
+interval because they read only the legacy key. Normal reads use the primary
+directly. An otherwise lock-free reader that misses the primary synchronously
+checks the two keys under the list lock.
+
+This protocol protects a list available when the operation takes the list
+lock. Independent eviction of the current list or its target states still
+requires sufficient shm capacity. The library logs evictions as warnings,
+failed writes as errors, and a missing list when a checker has local targets.
+These reports are limited to one warning and one error per minute for each
+shm in each worker.
 
 How many targets fit depends on how they are spread over the checkers,
 because the target list of a checker is one value: it needs a run of
