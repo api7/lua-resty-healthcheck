@@ -120,9 +120,11 @@ local function run(new_checker, op)
     end)
     ngx.say("purged")
     return
-  elseif op == "encoding" then
+  elseif op == "encoding" or op == "encoding_cjson" then
     ok, err = checker:add_target(ip, 33333, nil, true, nil, { invalid = function() end })
-    assert(not ok and err:find("seriali", 1, true), tostring(err))
+    assert(ok == nil and err:find("failed to store target_list in shm: ", 1, true) == 1,
+           tostring(err))
+    assert(err:find("seriali", 1, true), err)
     assert(raw:get(checker.TARGET_STATE .. ":" .. ip .. ":33333:" .. ip) == nil)
     ngx.say("retained=", raw:get(primary) == before, " writes=", count.main_writes,
             " staged=", count.stage_writes)

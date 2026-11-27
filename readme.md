@@ -195,10 +195,25 @@ list becomes authoritative and the change completes, including its normal
 status cleanup and events. The library tries to put those bytes back under
 the legacy primary key. If there is room only for the staged copy, upgraded
 workers can read it and retry publication under the lock on later reads.
-During a rolling upgrade, older workers can see an empty list in this
-interval because they read only the legacy key. Normal reads use the primary
-directly. An otherwise lock-free reader that misses the primary synchronously
-checks the two keys under the list lock.
+Normal reads use the primary directly. An otherwise lock-free reader that
+misses the primary synchronously checks the two keys under the list lock.
+
+During a rolling upgrade, workers running v3.2.6 read only the primary key.
+While only the staged copy fits, they can see an empty list. If those workers
+only read membership, an upgraded worker can restore the primary on a later
+read once enough space is available. If an old worker changes membership in
+that interval, it can recreate the primary from an empty list. For example,
+if the staged list contains A and B, an old worker adding C can publish a
+primary containing only C. Upgraded workers then use that primary. Freeing
+space does not bring back A or B.
+
+During the upgrade, prevent old workers from changing membership, including
+timer-driven purges, until they have exited. If that cannot be guaranteed,
+drain and stop the old workers before starting the new ones, then register
+the targets from the application's configuration. If old workers may have
+written while only the staged list was available, free enough shm capacity,
+compare each affected checker's target list with the authoritative
+configuration, re-register missing targets, and verify the complete list.
 
 This protocol protects a list available when the operation takes the list
 lock. Independent eviction of the current list or its target states still

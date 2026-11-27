@@ -158,12 +158,26 @@ our $HttpConfig = qq{
                     check_list(b, 22000, false)
                 else
                     wait_for("source")
+                    local missed = checker(a)
+                    assert(missed:stop())
                     we.register(function(data)
                         if data.port == 11001 then sync:set("event", true) end
                     end, sync:get("source"), "healthy")
                     assert(sync:set("subscribed", true))
                     wait_for("ready")
                     wait_for("event")
+                    -- Both additions were delivered while this checker was stopped.
+                    -- Its existing local copy must catch up from the staged list.
+                    assert(missed:get_target_status(ip, 11000) == nil)
+                    assert(missed:get_target_status(ip, 11001) == nil)
+                    assert(missed:start())
+                    local deadline = ngx.now() + 3
+                    while missed:get_target_status(ip, 11000) ~= false or
+                          missed:get_target_status(ip, 11001) ~= true do
+                        assert(ngx.now() < deadline, "existing checker did not reconcile from staging")
+                        ngx.sleep(0.01)
+                    end
+                    assert(not dict:get(missed.TARGET_LIST) and dict:get(missed.TARGET_LIST_STAGING))
                     check_list(a, 11000, false)
                     check_list(b, 22000, false)
                     local fresh = checker(a)

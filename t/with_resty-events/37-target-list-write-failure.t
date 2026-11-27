@@ -55,7 +55,7 @@ our $HttpConfig = qq{
 our $Config = q{
     location ~ ^/test/(.*)$ {
         content_by_lua_block {
-            if ngx.var.uri == "/test/encoding" then
+            if ngx.var.uri == "/test/encoding_cjson" then
                 -- Exercise the cjson.safe fallback, which returns nil and an error.
                 package.loaded["string.buffer"] = nil
                 package.preload["string.buffer"] = function() error("string.buffer unavailable") end
@@ -179,11 +179,11 @@ reads=4 writes=4 staged=4
 lua entry thread aborted
 
 
-=== TEST 10: failed encoding does not publish or leave a new target state
+=== TEST 10: cjson.safe encoding failure does not publish or leave a new target state
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- request
-GET /test/encoding
+GET /test/encoding_cjson
 --- response_body
 retained=true writes=0 staged=0
 --- no_error_log
@@ -222,5 +222,16 @@ GET /test/state
 --- response_body
 nil failed to set initial health status in shm: no memory
 retained=true a=false b=true staged=nil
+--- no_error_log
+lua entry thread aborted
+
+
+=== TEST 14: the default encoder rejects invalid metadata and rolls back the new target
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request
+GET /test/encoding
+--- response_body
+retained=true writes=0 staged=0
 --- no_error_log
 lua entry thread aborted

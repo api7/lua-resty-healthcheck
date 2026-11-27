@@ -669,8 +669,11 @@ end
 -- The caller holds TARGET_LIST_LOCK. Always write the inactive key first.
 -- Only the proposed list needs to fit, including when removing targets.
 local function store_target_list(self, targets, source)
-  local next_raw, err = serialize(targets)
-  if not next_raw then
+  -- string.buffer throws on unsupported values; cjson.safe returns nil, err.
+  local encoded, next_raw, err = pcall(serialize, targets)
+  if not encoded then
+    return nil, next_raw
+  elseif not next_raw then
     return nil, err
   end
 
