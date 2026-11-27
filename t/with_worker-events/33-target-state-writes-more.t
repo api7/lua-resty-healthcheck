@@ -637,3 +637,45 @@ GET /t
 ok=nil err=initial health status disappeared from shm listed=0 state=nil
 --- no_error_log
 lua entry thread aborted
+
+
+
+=== TEST 14: a new checker rebuilding a lost list keeps the shared state and counter
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local shm = ngx.shared.test_shm
+            local a = new_checker()
+            local state_key = key_of(a.TARGET_STATE, 11111)
+            local counter_key = key_of(a.TARGET_COUNTER, 11111)
+            assert(a:add_target(ip, 11111))
+            flush_events()
+            assert(a:report_http_status(ip, 11111, nil, 500, "passive"))
+            flush_events()
+            assert(status(a, 11111) == "false")
+
+            -- Leave older entries for the allocator to evict during replacement.
+            for i = 1, 100 do
+                assert(shm:set("filler-" .. i, i))
+            end
+            assert(shm:get(state_key) == 2 and shm:get(counter_key) == 256)
+            local ok, err = shm:set(a.TARGET_LIST, string.rep("x", shm:capacity() + 1))
+            assert(not ok and err == "no memory")
+            assert(shm:get(a.TARGET_LIST) == nil)
+
+            local b = new_checker()
+            assert(b:get_target_status(ip, 11111) == nil)
+            assert(shm:get(state_key) == 2 and shm:get(counter_key) == 256)
+            assert(b:add_target(ip, 11111, nil, true))
+            flush_events()
+            ngx.say("state=", shm:get(state_key), " counter=", shm:get(counter_key),
+                    " a=", status(a, 11111), " b=", status(b, 11111))
+        }
+    }
+--- request
+GET /t
+--- response_body
+state=2 counter=256 a=false b=false
+--- no_error_log
+lua entry thread aborted

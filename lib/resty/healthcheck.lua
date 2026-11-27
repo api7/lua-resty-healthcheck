@@ -714,8 +714,8 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
     local ok, err
     local state_filled = false
     local state_added = false
-    local known = get_target(self, ip, port, hostname)
     if found then
+      local known = get_target(self, ip, port, hostname)
       if known and known.internal_health then
         internal_health = known.internal_health
       end
@@ -725,11 +725,9 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
       elseif err == "exists" then
         ok, err = true, nil
       end
-    elseif known then
-      -- The list can be lost while this worker still knows the target. If the
-      -- shared state remains, use it and keep its counter: it may be newer
-      -- than this worker's copy. If it is gone, this is an ordinary re-add
-      -- after removal, so retain the usual fresh-target behavior.
+    else
+      -- A lost list can leave the state and counter intact, even for a new
+      -- checker with no local copy. Only a newly created state starts at zero.
       ok, err = self.shm:add(state_key, INTERNAL_STATES[internal_health])
       if ok then
         self.shm:delete(key_for(self.TARGET_COUNTER, ip, port, hostname))
@@ -745,14 +743,6 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
         end
         internal_health = shared_health
         ok, err = true, nil
-      end
-    else
-      -- a new target counts from zero: a report made for it after an earlier
-      -- removal, by a worker whose copy still had it, can have left a counter
-      self.shm:delete(key_for(self.TARGET_COUNTER, ip, port, hostname))
-      ok, err = self.shm:set(state_key, INTERNAL_STATES[internal_health])
-      if ok then
-        state_added = true
       end
     end
     if not ok then

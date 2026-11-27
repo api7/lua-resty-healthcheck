@@ -328,7 +328,7 @@ state=2 events=unhealthy a=false
             local a = new_checker()
             local state_key = key_of(a.TARGET_STATE, 11111)
             local real = a.shm
-            a.shm = failing_shm(real, state_key)
+            a.shm = failing_shm(real, state_key, { "add", "set" })
             local ok, err = a:add_target(ip, 11111, nil, true)
             a.shm = real
             ngx.say(tostring(ok), " ", tostring(err), " listed=",
