@@ -830,19 +830,12 @@ function checker:remove_target(ip, port, hostname)
       end
     end
 
-    if not target_found then
-      local known = get_target(self, ip, port, hostname)
-      if known then
-        -- A failed list replacement may have removed the list without sending
-        -- the removal event. Make the removal authoritative before clearing
-        -- the state, so a later report cannot treat membership as unknown.
-        local ok, err = self.shm:set(self.TARGET_LIST, serialize(target_list))
-        if not ok then
-          return nil, "failed to store target_list in shm: " .. err
-        end
-        clear_target_data_from_shm(self, known.ip, known.port, known.hostname)
-        self:raise_event(self.events.remove, known.ip, known.port, known.hostname)
-      end
+    -- A failed list replacement can leave a local target or shared health data
+    -- behind. A new checker has no local copy of those targets.
+    if not target_found and not get_target(self, ip, port, hostname)
+       and not self.shm:get(key_for(self.TARGET_STATE, ip, port, hostname))
+       and not self.shm:get(key_for(self.TARGET_COUNTER, ip, port, hostname))
+    then
       return true
     end
 

@@ -82,6 +82,33 @@ our $HttpConfig = qq{
             return prefix .. ":" .. ip .. ":" .. port .. ":" .. (hostname or ip)
         end
 
+        function new_checkers_after_list_loss()
+            local shm = ngx.shared.test_shm
+            local a = new_checker()
+            local state_key = key_of(a.TARGET_STATE, 11111)
+            local counter_key = key_of(a.TARGET_COUNTER, 11111)
+            assert(a:add_target(ip, 11111))
+            flush_events()
+            assert(a:report_http_status(ip, 11111, nil, 500, "passive"))
+            flush_events()
+            assert(status(a, 11111) == "false")
+
+            -- Leave older entries for the allocator to evict during replacement.
+            for i = 1, 100 do
+                assert(shm:set("filler-" .. i, i))
+            end
+            local version = assert(shm:get(a.TARGET_VERSION))
+            assert(shm:get(state_key) == 2 and shm:get(counter_key) == 256)
+            local ok, err = shm:set(a.TARGET_LIST, string.rep("x", shm:capacity() + 1))
+            assert(not ok and err == "no memory")
+            assert(shm:get(a.TARGET_LIST) == nil and shm:get(a.TARGET_VERSION) == version)
+
+            local b = new_checker()
+            assert(b:get_target_status(ip, 11111) == nil)
+            assert(shm:get(state_key) == 2 and shm:get(counter_key) == 256)
+            return a, b, state_key, counter_key
+        end
+
         -- a shm whose `methods` (set() if not given) fail for one key, as
         -- when the shm is full
         function failing_shm(real, failing_key, methods, delete_on_failure)
@@ -663,27 +690,7 @@ lua entry thread aborted
     location = /t {
         content_by_lua_block {
             local shm = ngx.shared.test_shm
-            local a = new_checker()
-            local state_key = key_of(a.TARGET_STATE, 11111)
-            local counter_key = key_of(a.TARGET_COUNTER, 11111)
-            assert(a:add_target(ip, 11111))
-            flush_events()
-            assert(a:report_http_status(ip, 11111, nil, 500, "passive"))
-            flush_events()
-            assert(status(a, 11111) == "false")
-
-            -- Leave older entries for the allocator to evict during replacement.
-            for i = 1, 100 do
-                assert(shm:set("filler-" .. i, i))
-            end
-            assert(shm:get(state_key) == 2 and shm:get(counter_key) == 256)
-            local ok, err = shm:set(a.TARGET_LIST, string.rep("x", shm:capacity() + 1))
-            assert(not ok and err == "no memory")
-            assert(shm:get(a.TARGET_LIST) == nil)
-
-            local b = new_checker()
-            assert(b:get_target_status(ip, 11111) == nil)
-            assert(shm:get(state_key) == 2 and shm:get(counter_key) == 256)
+            local a, b, state_key, counter_key = new_checkers_after_list_loss()
             assert(b:add_target(ip, 11111, nil, true))
             flush_events()
             ngx.say("state=", shm:get(state_key), " counter=", shm:get(counter_key),
@@ -694,5 +701,64 @@ lua entry thread aborted
 GET /t
 --- response_body
 state=2 counter=256 a=false b=false
+--- no_error_log
+lua entry thread aborted
+
+
+
+=== TEST 15: removing a shared orphan from a new checker allows a fresh re-add
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local shm = ngx.shared.test_shm
+            local a, b, state_key, counter_key = new_checkers_after_list_loss()
+
+            -- Removing an unrelated, absent target leaves the missing list alone.
+            local version = shm:get(b.TARGET_VERSION)
+            assert(b:remove_target(ip, 22222))
+            assert(shm:get(b.TARGET_LIST) == nil and shm:get(b.TARGET_VERSION) == version)
+
+            assert(b:remove_target(ip, 11111, ip))
+            flush_events()
+            ngx.say("removed: list_written=", tostring(shm:get(b.TARGET_LIST) ~= nil),
+                    " a=", status(a, 11111), " state=", tostring(shm:get(state_key)),
+                    " counter=", tostring(shm:get(counter_key)))
+            assert(b:add_target(ip, 11111, nil, true))
+            flush_events()
+            ngx.say("re-added: a=", status(a, 11111), " b=", status(b, 11111),
+                    " state=", shm:get(state_key), " counter=", tostring(shm:get(counter_key)))
+        }
+    }
+--- request
+GET /t
+--- response_body
+removed: list_written=true a=nil/target not found state=nil counter=nil
+re-added: a=true b=true state=1 counter=nil
+--- no_error_log
+lua entry thread aborted
+
+
+
+=== TEST 16: either surviving shared key is enough for explicit removal
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local checker = new_checker()
+            local shm = ngx.shared.test_shm
+            for _, entry in ipairs({ { checker.TARGET_STATE, 2 }, { checker.TARGET_COUNTER, 256 } }) do
+                local key = key_of(entry[1], 11111)
+                assert(shm:set(key, entry[2]))
+                assert(checker:remove_target(ip, 11111))
+                assert(shm:get(key) == nil)
+            end
+            ngx.say("removed")
+        }
+    }
+--- request
+GET /t
+--- response_body
+removed
 --- no_error_log
 lua entry thread aborted
