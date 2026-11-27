@@ -355,7 +355,7 @@ nil failed to set initial health status in shm: no memory listed=0
             local a = new_checker()
             local state_key = key_of(a.TARGET_STATE, 11111)
             local real = a.shm
-            a.shm = failing_shm(real, a.TARGET_LIST)
+            a.shm = failing_shm(real, a.TARGET_LIST, { "set", "safe_add", "safe_set" })
             local ok, err = a:add_target(ip, 11111, nil, true)
             a.shm = real
             ngx.say(tostring(ok), " ", tostring(err), " state=", tostring(shm:get(state_key)))
@@ -511,7 +511,7 @@ b=false state=2 events=0
             assert(a:set_target_status(ip, 11111, nil, false))
             assert(a:delayed_clear(10))
             local real = a.shm
-            a.shm = failing_shm(real, a.TARGET_LIST)
+            a.shm = failing_shm(real, a.TARGET_LIST, { "set", "safe_add", "safe_set" })
             local ok, err = a:add_target(ip, 11111, nil, true)
             a.shm = real
             ngx.say(tostring(ok), " ", tostring(err), " state=", tostring(shm:get(state_key)),
@@ -542,7 +542,7 @@ nil failed to store target_list in shm: no memory state=2 listed=1
             assert(a:delayed_clear(10))
             shm:delete(state_key)
             local real = a.shm
-            a.shm = failing_shm(real, state_key, { "add", "set" })
+            a.shm = failing_shm(real, state_key, { "add", "safe_add", "set", "safe_set" })
             local ok, err = a:add_target(ip, 11111, nil, true)
             a.shm = real
             local list = healthcheck.get_target_list("testing", "test_shm")

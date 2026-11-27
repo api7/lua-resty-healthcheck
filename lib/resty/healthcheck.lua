@@ -149,6 +149,8 @@ end
 local EVENT_SOURCE_PREFIX = "lua-resty-healthcheck"
 local LOG_PREFIX = "[healthcheck] "
 local SHM_PREFIX = "lua-resty-healthcheck:"
+-- Outside the legacy namespace even when a checker name or hostname contains a colon.
+local STAGED_LIST_PREFIX = "lua-resty-healthcheck-staged-list:"
 local EMPTY = setmetatable({},{
     __newindex = function()
       error("the EMPTY table is read only, check your code!", 2)
@@ -288,7 +290,9 @@ local SHM_REPORT_INTERVAL = 60
 local shm_reports = {}  -- shm name => level => { last = time of the last report, skipped = n }
 
 local function describe_key(key)
-  if key:sub(-12) == ":target_list" then
+  if key:sub(1, #STAGED_LIST_PREFIX) == STAGED_LIST_PREFIX then
+    return "a staged target list"
+  elseif key:sub(-12) == ":target_list" then
     return "a target list"
   elseif key:find(":state:", 1, true) then
     return "the state of a target"
@@ -376,11 +380,23 @@ local function watched_shm(shm_name)
     return ...
   end
 
+  -- These writes can fail without first evicting other entries.
+  local function check_safe(key, ...)
+    local ok, err = ...
+    if not ok and err == "no memory" then
+      report_shm(shm_name, ERR, "is full: ", tostring(key),
+                 " could not be stored without evicting other entries")
+    end
+    return ...
+  end
+
   watched = setmetatable({
     get = function(_, key) return shm:get(key) end,
     delete = function(_, key) return shm:delete(key) end,
     set = function(_, key, ...) return check(key, shm:set(key, ...)) end,
     add = function(_, key, ...) return check(key, shm:add(key, ...)) end,
+    safe_add = function(_, key, ...) return check_safe(key, shm:safe_add(key, ...)) end,
+    safe_set = function(_, key, ...) return check_safe(key, shm:safe_set(key, ...)) end,
     replace = function(_, key, ...) return check(key, shm:replace(key, ...)) end,
     incr = function(_, key, ...) return check(key, shm:incr(key, ...)) end,
   }, {
@@ -399,7 +415,7 @@ local function watched_shm(shm_name)
 end
 
 
-local run_locked
+local run_locked, read_locked
 do
   -- resty_lock is restricted to this scope in order to keep sensitive
   -- lock-handling code separate separate from all other business logic
@@ -466,7 +482,7 @@ do
   -- @param ... arguments that will be passed to fn
   -- @return The results of the function; or nil and an error message
   -- in case it fails locking.
-  function run_locked(self, key, fn, ...)
+  local function with_lock(self, key, may_schedule, fn, ...)
     -- we're extra extra extra defensive in this code path
     local typ = type(key)
      -- XXX is a number key ever expected?
@@ -497,7 +513,7 @@ do
       local elapsed
       elapsed, err = lock:lock(key)
 
-      if not elapsed and err == "timeout" and not yield then
+      if not elapsed and err == "timeout" and not yield and may_schedule then
         -- yielding is not possible in the current phase, so retry in a timer
         return schedule(self, key, fn, ...)
 
@@ -518,6 +534,15 @@ do
     end
 
     return perr, res
+  end
+
+  run_locked = function(self, key, fn, ...)
+    return with_lock(self, key, true, fn, ...)
+  end
+
+  read_locked = function(self, key, fn, ...)
+    -- A synchronous read must never return a scheduled timer as its value.
+    return with_lock(self, key, false, fn, ...)
   end
 end
 
@@ -573,10 +598,57 @@ local checker = {}
 ------------------------------------------------------------------------------
 
 
--- @return the target list from the shm, an empty table if not found, or
--- `nil + error` upon a failure
-local function fetch_target_list(self)
-  local target_list, err = self.shm:get(self.TARGET_LIST)
+-- Writers stage new bytes before replacing the primary. The primary wins
+-- until it is removed by a failed replacement or the new value is published.
+local function read_list_under_lock(self, repair)
+  local raw, err = self.shm:get(self.TARGET_LIST)
+  if raw or err then
+    return raw, err, self.TARGET_LIST
+  end
+  raw, err = self.shm:get(self.TARGET_LIST_STAGING)
+  if not raw or err then
+    return raw, err
+  end
+
+  if not repair then
+    -- The writer can publish its proposed value directly in the vacant
+    -- primary slot without first allocating space for the old list there.
+    return raw, nil, self.TARGET_LIST_STAGING
+  end
+
+  -- Repair the legacy key when capacity returns, even if the configuration
+  -- never changes again. A failed safe_add cannot evict the committed list.
+  local restored, restore_err = self.shm:safe_add(self.TARGET_LIST, raw)
+  if restored then
+    self.shm:delete(self.TARGET_LIST_STAGING)
+    return raw, nil, self.TARGET_LIST
+  elseif restore_err == "exists" then
+    local current = self.shm:get(self.TARGET_LIST)
+    if current then
+      return current, nil, self.TARGET_LIST
+    end
+  end
+  return raw, nil, self.TARGET_LIST_STAGING
+end
+
+
+local function read_target_list(self, locked, repair)
+  if locked then
+    return read_list_under_lock(self, repair)
+  end
+  local raw, err = self.shm:get(self.TARGET_LIST)
+  if raw or err then
+    return raw, err
+  end
+  -- Recheck both under the writer's lock so a provisional list from a later
+  -- operation cannot be mistaken for an already committed fallback.
+  return read_locked(self, self.TARGET_LIST_LOCK, read_list_under_lock, self, true)
+end
+
+
+-- @return the decoded list (empty if absent), an error, and its source key.
+local function fetch_target_list(self, locked, repair)
+  local target_list, err, source = read_target_list(self, locked, repair)
   if err then
     return nil, "failed to fetch target_list from shm: " .. err
   end
@@ -590,19 +662,71 @@ local function fetch_target_list(self)
                "likely because the shm is full")
   end
 
-  return target_list and deserialize(target_list) or {}
+  return target_list and deserialize(target_list) or {}, nil, source
 end
 
 
-local function with_target_list(self, fn)
-  local targets, err = fetch_target_list(self)
+-- The caller holds TARGET_LIST_LOCK. Always write the inactive key first.
+-- Only the proposed list needs to fit, including when removing targets.
+local function store_target_list(self, targets, source)
+  -- string.buffer throws on unsupported values; cjson.safe returns nil, err.
+  local encoded, next_raw, err = pcall(serialize, targets)
+  if not encoded then
+    return nil, next_raw
+  elseif not next_raw then
+    return nil, err
+  end
+
+  local shm, primary, staged = self.shm, self.TARGET_LIST, self.TARGET_LIST_STAGING
+  if source ~= primary then
+    -- First creation, or a committed staged list awaiting republication.
+    -- Leave that list intact if a new primary cannot fit.
+    local ok, write_err = shm:safe_add(primary, next_raw)
+    if ok and source then
+      shm:delete(staged)
+    end
+    return ok, write_err
+  end
+
+  -- This also replaces a dormant stage left by an interrupted writer. The
+  -- current primary remains authoritative if reserving the new value fails.
+  local ok, stage_err = shm:safe_set(staged, next_raw)
+  if not ok then
+    return nil, stage_err
+  end
+  ok, err = shm:safe_set(primary, next_raw)
+  if not ok then
+    -- A failed replacement can delete the primary. In that case the staged
+    -- value is the committed list. Try to restore the legacy key as well.
+    local restored = shm:safe_add(primary, next_raw)
+    if not restored then
+      local winner = shm:get(primary)
+      if not winner then
+        if shm:get(staged) == next_raw then
+          return true
+        end
+        return nil, err
+      end
+      if winner ~= next_raw then
+        shm:delete(staged)
+        return nil, err
+      end
+    end
+  end
+  shm:delete(staged)
+  return true
+end
+
+
+local function with_target_list(self, fn, repair)
+  local targets, err, source = fetch_target_list(self, true, repair)
   if not targets then
     return nil, err
   end
 
   -- this is only ever called in the context of `run_locked`,
   -- so no pcall needed
-  return fn(targets)
+  return fn(targets, source)
 end
 
 
@@ -611,8 +735,8 @@ end
 -- @param fn The function to execute
 -- @return The results of the function; or nil and an error message
 -- in case it fails locking.
-local function locking_target_list(self, fn)
-  local ok, err = run_locked(self, self.TARGET_LIST_LOCK, with_target_list, self, fn)
+local function locking_target_list(self, fn, repair)
+  local ok, err = run_locked(self, self.TARGET_LIST_LOCK, with_target_list, self, fn, repair)
 
   if ok == "scheduled" then
     self:log(DEBUG, "target_list function re-scheduled in timer")
@@ -651,7 +775,7 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
 
   local internal_health = is_healthy and "healthy" or "unhealthy"
 
-  local ok, err = locking_target_list(self, function(target_list)
+  local ok, err = locking_target_list(self, function(target_list, source)
     local found = false
 
     -- check whether we already have this target
@@ -684,7 +808,7 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
       if known and known.internal_health then
         internal_health = known.internal_health
       end
-      ok, err = self.shm:add(state_key, INTERNAL_STATES[internal_health])
+      ok, err = self.shm:safe_add(state_key, INTERNAL_STATES[internal_health])
       if ok then
         state_filled = true
       elseif err == "exists" then
@@ -694,7 +818,11 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
       -- a new target counts from zero: a report made for it after an earlier
       -- removal, by a worker whose copy still had it, can have left a counter
       self.shm:delete(key_for(self.TARGET_COUNTER, ip, port, hostname))
-      ok, err = self.shm:set(state_key, INTERNAL_STATES[internal_health])
+      if source then
+        ok, err = self.shm:safe_set(state_key, INTERNAL_STATES[internal_health])
+      else
+        ok, err = self.shm:set(state_key, INTERNAL_STATES[internal_health])
+      end
     end
     if not ok then
       -- a checker created later would load a listed target without a state
@@ -712,9 +840,8 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
         meta = tbl_meta,
       }
     end
-    target_list = serialize(target_list)
 
-    ok, err = self.shm:set(self.TARGET_LIST, target_list)
+    ok, err = store_target_list(self, target_list, source)
     if not ok then
       if not found then
         -- leave no state behind for a target that is not listed
@@ -768,7 +895,7 @@ function checker:remove_target(ip, port, hostname)
   ip   = tostring(assert(ip, "no ip address provided"))
   port = assert(tonumber(port), "no port number provided")
 
-  return locking_target_list(self, function(target_list)
+  return locking_target_list(self, function(target_list, source)
 
     -- find the target
     local target_found
@@ -784,13 +911,10 @@ function checker:remove_target(ip, port, hostname)
       return true
     end
 
-    -- go update the shm
-    target_list = serialize(target_list)
-
     -- we first write the updated list, and only then remove the health
     -- status; this prevents race conditions when a healthchecker gets the
     -- initial state from the shm
-    local ok, err = self.shm:set(self.TARGET_LIST, target_list)
+    local ok, err = store_target_list(self, target_list, source)
     if not ok then
       return nil, "failed to store target_list in shm: " .. err
     end
@@ -809,20 +933,15 @@ end
 -- @return `true` on success, or `nil + error` on failure.
 function checker:clear()
 
-  return locking_target_list(self, function(target_list)
+  return locking_target_list(self, function(target_list, source)
 
-    local old_target_list = target_list
-
-    -- go update the shm
-    target_list = serialize({})
-
-    local ok, err = self.shm:set(self.TARGET_LIST, target_list)
+    local ok, err = store_target_list(self, {}, source)
     if not ok then
       return nil, "failed to store target_list in shm: " .. err
     end
 
     -- remove all individual statuses
-    for _, target in ipairs(old_target_list) do
+    for _, target in ipairs(target_list) do
       local ip, port, hostname = target.ip, target.port, target.hostname
       clear_target_data_from_shm(self, ip, port, hostname)
     end
@@ -851,7 +970,7 @@ end
 function checker:delayed_clear(delay)
   assert(tonumber(delay), "no delay provided")
 
-  return locking_target_list(self, function(target_list)
+  return locking_target_list(self, function(target_list, source)
     local purge_time = ngx_now() + delay
 
     -- add purge time to all targets
@@ -859,8 +978,7 @@ function checker:delayed_clear(delay)
       target.purge_time = purge_time
     end
 
-    target_list = serialize(target_list)
-    local ok, err = self.shm:set(self.TARGET_LIST, target_list)
+    local ok, err = store_target_list(self, target_list, source)
     if not ok then
       return nil, "failed to store target_list in shm: " .. err
     end
@@ -929,7 +1047,7 @@ end
 -- from a full shm: membership is then unknown.
 -- @return `"listed"`, `"unlisted"` or `"unknown"`, or `nil + error`.
 local function target_membership(self, ip, port, hostname)
-  local raw, err = self.shm:get(self.TARGET_LIST)
+  local raw, err = read_target_list(self)
   if err then
     return nil, "failed to fetch target_list from shm: " .. err
   end
@@ -2251,7 +2369,7 @@ local function sync_from_shm(self, budget)
     self.removed_versions = nil
     self.removed_versions_n = nil
   end
-  local raw, err = shm:get(self.TARGET_LIST)
+  local raw, err = read_target_list(self)
   if err then
     return nil, "failed to fetch target_list from shm: " .. err
   end
@@ -2849,6 +2967,7 @@ function _M.new(opts)
   self.TARGET_STATE     = SHM_PREFIX .. self.name .. ":state"
   self.TARGET_COUNTER   = SHM_PREFIX .. self.name .. ":counter"
   self.TARGET_LIST      = SHM_PREFIX .. self.name .. ":target_list"
+  self.TARGET_LIST_STAGING = STAGED_LIST_PREFIX .. self.name
   self.TARGET_LIST_LOCK = SHM_PREFIX .. self.name .. ":target_list_lock"
   self.TARGET_LOCK      = SHM_PREFIX .. self.name .. ":target_lock"
   self.TARGET_VERSION   = SHM_PREFIX .. self.name .. ":version"
@@ -2895,7 +3014,7 @@ function _M.new(opts)
       end
 
       return true
-    end)
+    end, true)
     if not ok then
       -- locking failed, we don't protect `targets` of being nil in other places
       -- so consider this as not recoverable
@@ -2975,7 +3094,7 @@ function _M.new(opts)
         if won then
           for _, checker_obj in pairs(hcs) do
             -- clear targets marked for delayed removal
-            locking_target_list(checker_obj, function(target_list)
+            locking_target_list(checker_obj, function(target_list, source)
               local removed_targets = {}
               local index = 1
               while index <= #target_list do
@@ -2989,11 +3108,9 @@ function _M.new(opts)
               end
 
               if #removed_targets > 0 then
-                target_list = serialize(target_list)
-
                 -- each checker has its own shm: `shm` above is the one of the
                 -- checker that started this timer
-                local ok, err = checker_obj.shm:set(checker_obj.TARGET_LIST, target_list)
+                local ok, err = store_target_list(checker_obj, target_list, source)
                 if not ok then
                   return nil, "failed to store target_list in shm: " .. err
                 end
@@ -3108,6 +3225,7 @@ function _M.get_target_list(name, shm_name)
   self.TARGET_STATE     = SHM_PREFIX .. self.name .. ":state"
   self.TARGET_COUNTER   = SHM_PREFIX .. self.name .. ":counter"
   self.TARGET_LIST      = SHM_PREFIX .. self.name .. ":target_list"
+  self.TARGET_LIST_STAGING = STAGED_LIST_PREFIX .. self.name
   self.TARGET_LIST_LOCK = SHM_PREFIX .. self.name .. ":target_list_lock"
   self.LOG_PREFIX       = LOG_PREFIX .. "(" .. self.name .. ") "
 
@@ -3122,7 +3240,7 @@ function _M.get_target_list(name, shm_name)
     end
 
     return true
-  end)
+  end, true)
 
   for _, target in ipairs(self.targets) do
     local key = key_for(self.TARGET_LOCK, target.ip, target.port, target.hostname)

@@ -139,7 +139,7 @@ GET /t
 --- response_body
 nil failed to store target_list in shm: no memory
 --- error_log eval
-qr/\[error\].*\[healthcheck\] shm 'small_shm' is full: a target list \('lua-resty-healthcheck:testing:target_list'\) could not be stored(?:, other entries were evicted trying)?, and the value it had before, if any, is gone\. This shm holds .* increase the size of this lua_shared_dict/
+qr/\[error\].*\[healthcheck\] shm 'small_shm' is full: a target list \('lua-resty-healthcheck:testing:target_list'\) could not be stored without evicting other entries\. This shm holds .* increase the size of this lua_shared_dict/
 
 
 
@@ -246,9 +246,7 @@ qr/\[healthcheck\] shm '/
         content_by_lua_block {
             local healthcheck = require("resty.healthcheck")
             healthcheck._set_cleanup_interval(0.2)
-            fill(ngx.shared.small_shm)
             local checker = new_checker("small_shm")
-            -- these writes evict entries: one warning, and no other for a minute
             assert(checker:add_target(ip, 11111, nil, true))
             assert(checker:add_target(ip, 22222, nil, true))
             local deadline = ngx.now() + 2
@@ -258,6 +256,9 @@ qr/\[healthcheck\] shm '/
                 ngx.update_time()
             end
 
+            -- Fill the zone through the watched dictionary to produce one
+            -- actual eviction warning after both targets have been registered.
+            fill(checker.shm)
             -- the list is lost; the periodic cleanup reads it
             ngx.shared.small_shm:delete(checker.TARGET_LIST)
             assert(wait_cleanups(2), "the periodic cleanup did not run")
