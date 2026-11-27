@@ -399,7 +399,7 @@ local function watched_shm(shm_name)
 end
 
 
-local run_locked
+local run_locked, run_locked_pair
 do
   -- resty_lock is restricted to this scope in order to keep sensitive
   -- lock-handling code separate separate from all other business logic
@@ -462,11 +462,12 @@ do
   --
   -- @param self The checker object
   -- @param key the key/identifier to acquire a lock for
+  -- @param schedule_on_contention whether a non-yieldable lock miss schedules a retry
   -- @param fn The function to execute
   -- @param ... arguments that will be passed to fn
   -- @return The results of the function; or nil and an error message
   -- in case it fails locking.
-  function run_locked(self, key, fn, ...)
+  local function run_locked_with_contention(self, key, schedule_on_contention, fn, ...)
     -- we're extra extra extra defensive in this code path
     local typ = type(key)
      -- XXX is a number key ever expected?
@@ -499,7 +500,10 @@ do
 
       if not elapsed and err == "timeout" and not yield then
         -- yielding is not possible in the current phase, so retry in a timer
-        return schedule(self, key, fn, ...)
+        if schedule_on_contention then
+          return schedule(self, key, fn, ...)
+        end
+        return "scheduled"
 
       elseif not elapsed then
         return nil, "failed acquiring lock for '" .. key .. "', " .. err
@@ -518,6 +522,23 @@ do
     end
 
     return perr, res
+  end
+
+  run_locked = function(self, key, fn, ...)
+    return run_locked_with_contention(self, key, true, fn, ...)
+  end
+
+  -- A timer retry keeps this lock order and never runs the callback while
+  -- holding only one of the locks it needs.
+  run_locked_pair = function(self, first_key, second_key, fn, ...)
+    return run_locked(self, first_key, function(...)
+      local ok, err = run_locked_with_contention(self, second_key, false, fn, ...)
+      if ok == "scheduled" then
+        return schedule(self, first_key, run_locked_with_contention,
+                        self, second_key, true, fn, ...)
+      end
+      return ok, err
+    end, ...)
   end
 end
 
@@ -622,6 +643,19 @@ local function locking_target_list(self, fn)
 end
 
 
+local function locking_target_and_list(self, ip, port, hostname, fn)
+  local key = key_for(self.TARGET_LOCK, ip, port, hostname)
+  local ok, err = run_locked_pair(self, key, self.TARGET_LIST_LOCK,
+                                  with_target_list, self, fn)
+
+  if ok == "scheduled" then
+    self:log(DEBUG, "target and target_list functions re-scheduled in timer")
+  end
+
+  return ok, err
+end
+
+
 --- Get a target
 local function get_target(self, ip, port, hostname)
   hostname = hostname or ip
@@ -651,7 +685,7 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
 
   local internal_health = is_healthy and "healthy" or "unhealthy"
 
-  local ok, err = locking_target_list(self, function(target_list)
+  local ok, err = locking_target_and_list(self, ip, port, hostname, function(target_list)
     local found = false
 
     -- check whether we already have this target
@@ -679,6 +713,7 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
     local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
     local ok, err
     local state_filled = false
+    local state_added = false
     if found then
       local known = get_target(self, ip, port, hostname)
       if known and known.internal_health then
@@ -691,10 +726,24 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
         ok, err = true, nil
       end
     else
-      -- a new target counts from zero: a report made for it after an earlier
-      -- removal, by a worker whose copy still had it, can have left a counter
-      self.shm:delete(key_for(self.TARGET_COUNTER, ip, port, hostname))
-      ok, err = self.shm:set(state_key, INTERNAL_STATES[internal_health])
+      -- A lost list can leave the state and counter intact, even for a new
+      -- checker with no local copy. Only a newly created state starts at zero.
+      ok, err = self.shm:add(state_key, INTERNAL_STATES[internal_health])
+      if ok then
+        self.shm:delete(key_for(self.TARGET_COUNTER, ip, port, hostname))
+        state_added = true
+      elseif err == "exists" then
+        local value, get_err = self.shm:get(state_key)
+        if get_err then
+          return nil, "failed to fetch initial health status from shm: " .. get_err
+        end
+        local shared_health = INTERNAL_STATES[value]
+        if not shared_health then
+          return nil, "initial health status disappeared from shm"
+        end
+        internal_health = shared_health
+        ok, err = true, nil
+      end
     end
     if not ok then
       -- a checker created later would load a listed target without a state
@@ -716,7 +765,7 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader, tbl_meta
 
     ok, err = self.shm:set(self.TARGET_LIST, target_list)
     if not ok then
-      if not found then
+      if state_added then
         -- leave no state behind for a target that is not listed
         self.shm:delete(state_key)
       end
@@ -767,8 +816,9 @@ end
 function checker:remove_target(ip, port, hostname)
   ip   = tostring(assert(ip, "no ip address provided"))
   port = assert(tonumber(port), "no port number provided")
+  hostname = hostname or ip
 
-  return locking_target_list(self, function(target_list)
+  return locking_target_and_list(self, ip, port, hostname, function(target_list)
 
     -- find the target
     local target_found
@@ -780,7 +830,12 @@ function checker:remove_target(ip, port, hostname)
       end
     end
 
-    if not target_found then
+    -- A failed list replacement can leave a local target or shared health data
+    -- behind. A new checker has no local copy of those targets.
+    if not target_found and not get_target(self, ip, port, hostname)
+       and not self.shm:get(key_for(self.TARGET_STATE, ip, port, hostname))
+       and not self.shm:get(key_for(self.TARGET_COUNTER, ip, port, hostname))
+    then
       return true
     end
 
